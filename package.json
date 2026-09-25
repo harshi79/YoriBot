@@ -1,14 +1,15 @@
 {
-  "name": "agrrhbot",
-  "version": "1.0.0",
+  "name": "yoribot",
+  "version": "2.0.0",
   "private": true,
-  "description": "WHoevenYori — the ultimate anonymous-message Telegram bot (two-way threads, smooth inline UI, free reactions, privacy controls, abuse filter + report/block, group Q&A with ephemeral confirmations, public confession wall, inline sharing).",
+  "description": "YoriBot — a Telegram whisper bot (invisible one-to-one messages in groups via Bot API 10.2 ephemeral messages) plus a two-way anonymous inbox, group Q&A, confession wall and inline sharing. Free Bot API features only, no Telegram Premium.",
   "main": "src/index.js",
   "type": "commonjs",
   "scripts": {
     "start": "node src/index.js",
     "dev": "node src/index.js",
-    "selftest": "node test/selftest.js"
+    "selftest": "node test/selftest.js",
+    "test": "node test/selftest.js"
   },
   "engines": {
     "node": ">=18"
@@ -16,5 +17,15 @@
   "dependencies": {
     "dotenv": "^16.4.5",
     "node-telegram-bot-api": "^2.1.0"
-  }
+  },
+  "keywords": [
+    "telegram",
+    "telegram-bot",
+    "whisper",
+    "whisperbot",
+    "anonymous",
+    "ephemeral-messages",
+    "bot-api-10.3"
+  ],
+  "license": "MIT"
 }
