@@ -1,9 +1,10 @@
 'use strict';
 module.exports = {
   BOT_TOKEN: process.env.BOT_TOKEN,
-  BOT_USERNAME: process.env.BOT_USERNAME,
+  BOT_USERNAME: process.env.BOT_USERNAME || 'WHoevenYori',
   CHANNEL_ID: process.env.CHANNEL_ID,
   ADMIN_ID: process.env.ADMIN_ID,
+  BANNED_WORDS: process.env.BANNED_WORDS,
   WEBHOOK_URL: process.env.WEBHOOK_URL,
   WEBHOOK_SECRET: process.env.WEBHOOK_SECRET,
   PORT: process.env.PORT ? Number(process.env.PORT) : 3000,

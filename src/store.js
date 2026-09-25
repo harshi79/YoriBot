@@ -1,6 +1,6 @@
 'use strict';
 /*
- * Persistent store for AgrrhBot.
+ * Persistent store for WHoevenYori.
  * JSON-file backed (zero native deps). For a viral-scale deployment, swap this
  * for SQLite/Postgres — the engine only depends on these method names.
  */
@@ -28,10 +28,16 @@ class Store {
         activePair: s.activePair || {},
         linkMap: s.linkMap || {},
         sendLog: s.sendLog || {},
-        pairLog: s.pairLog || {}
+        pairLog: s.pairLog || {},
+        blocked: s.blocked || {},          // owner -> [senderChatId]
+        reports: s.reports || [],          // [{owner, sender, threadId, text, ts}]
+        groups: s.groups || {},            // groupId -> {groupId, token, active, questions}
+        groupTokens: s.groupTokens || {},  // token -> groupId
+        groupSessions: s.groupSessions || {} // senderChatId -> {groupId, panelChatId, panelMsgId}
       };
     } catch {
-      return { users: {}, tokens: {}, sessions: {}, threads: {}, activePair: {}, linkMap: {}, sendLog: {}, pairLog: {} };
+      return { users: {}, tokens: {}, sessions: {}, threads: {}, activePair: {}, linkMap: {},
+        sendLog: {}, pairLog: {}, blocked: {}, reports: [], groups: {}, groupTokens: {}, groupSessions: {} };
     }
   }
 
@@ -128,6 +134,45 @@ class Store {
     this._save();
     return { ok: true };
   }
+
+  // ---- block / report ----
+  isBlocked(owner, sender) {
+    owner = String(owner); sender = String(sender);
+    return !!(this.state.blocked[owner] && this.state.blocked[owner].includes(sender));
+  }
+  block(owner, sender) {
+    owner = String(owner); sender = String(sender);
+    this.state.blocked[owner] = this.state.blocked[owner] || [];
+    if (!this.state.blocked[owner].includes(sender)) { this.state.blocked[owner].push(sender); this._save(); }
+  }
+  unblock(owner, sender) {
+    owner = String(owner); sender = String(sender);
+    if (this.state.blocked[owner]) {
+      this.state.blocked[owner] = this.state.blocked[owner].filter(s => s !== sender);
+      this._save();
+    }
+  }
+  listBlocked(owner) { return this.state.blocked[String(owner)] || []; }
+  addReport(r) { this.state.reports.push({ ts: Date.now(), ...r }); this._save(); }
+  getReports() { return this.state.reports; }
+
+  // ---- group "ask me anything" ----
+  getOrCreateGroup(groupId) {
+    groupId = String(groupId);
+    if (this.state.groups[groupId]) return this.state.groups[groupId].token;
+    const token = crypto.randomBytes(5).toString('hex');
+    this.state.groups[groupId] = { groupId, token, active: true, questions: 0 };
+    this.state.groupTokens[token] = groupId;
+    this._save();
+    return token;
+  }
+  getGroup(groupId) { return this.state.groups[String(groupId)] || null; }
+  getGroupByToken(token) { const g = this.state.groupTokens[token]; return g ? String(g) : null; }
+  setGroupActive(groupId, v) { const g = this.getGroup(groupId); if (g) { g.active = !!v; this._save(); } }
+  recordGroupQuestion(groupId) { const g = this.getGroup(groupId); if (g) { g.questions++; this._save(); } }
+  setGroupSession(sender, session) { this.state.groupSessions[String(sender)] = session; this._save(); }
+  getGroupSession(sender) { return this.state.groupSessions[String(sender)] || null; }
+  clearGroupSession(sender) { delete this.state.groupSessions[String(sender)]; this._save(); }
 }
 
 module.exports = Store;

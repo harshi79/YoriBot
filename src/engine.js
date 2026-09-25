@@ -1,6 +1,6 @@
 'use strict';
 /*
- * AgrrhBot engine — pure business logic. No Telegram imports here.
+ * WHoevenYori engine — pure business logic. No Telegram imports here.
  * It talks to a tiny `bot` adapter interface so we can unit-test it with a mock:
  *   bot.username                     -> string
  *   bot.sendText(chatId, text, opts) -> { message_id }
@@ -12,6 +12,7 @@
  *   bot.answerInline(inlineQueryId, results)
  */
 const { classifyMessage, hasMedia } = require('./media');
+const { checkAbuse } = require('./filter');
 
 const REACTIONS = ['👀', '📨', '💌', '🔥', '✨', '🤫', '💬', '🫣'];
 const IDEAS = [
@@ -30,7 +31,7 @@ const esc = (s) => String(s == null ? '' : s)
 const pick = (a) => a[Math.floor(Math.random() * a.length)];
 const linkFor = (username, token) => `https://t.me/${username}?start=${token}`;
 const chatId = (msg) => String(msg.chat.id);
-const safe = async (p) => { try { await p; } catch (e) { /* reactions/edits are best-effort */ } };
+const safe = async (p) => { try { await p; } catch (e) { /* best-effort (reactions/edits/ephemeral) */ } };
 
 // ---- keyboards (plain InlineKeyboardMarkup JSON) ----
 function shareKeyboard(link) {
@@ -41,6 +42,12 @@ function composeKeyboard() {
   return { inline_keyboard: [[
     { text: '💡 Idea', callback_data: 'idea' },
     { text: '🚪 Cancel', callback_data: 'cancel' }
+  ]] };
+}
+function reportKeyboard(deliveredMsgId) {
+  return { inline_keyboard: [[
+    { text: '🚩 Report', callback_data: 'report:' + deliveredMsgId },
+    { text: '🚫 Block', callback_data: 'block:' + deliveredMsgId }
   ]] };
 }
 function menuKeyboard(u) {
@@ -69,14 +76,14 @@ const NO_PREVIEW = { link_preview_options: { is_disabled: true } };
 function welcomeHTML(user, link) {
   const name = esc(user.firstName || 'there');
   return `👋 <b>Hey ${name}!</b>\n\n` +
-    `I'm <b>AgrrhBot</b> — your secret anonymous inbox.\n\n` +
+    `I'm <b>WHoevenYori</b> — your secret anonymous inbox.\n\n` +
     `🔗 <b>Your link:</b>\n<code>${esc(link)}</code>\n\n` +
     `Share it anywhere. Friends who open it can message you <b>anonymously</b> — and you can reply back, still anonymous. Threaded, private, no names.\n\n` +
     `Tap a button below to get started.`;
 }
 function menuHTML(u, botUsername) {
   const link = linkFor(botUsername, u.token);
-  return `🎛 <b>AgrrhBot Control Panel</b>\n\n` +
+  return `🎛 <b>WHoevenYori Control Panel</b>\n\n` +
     `▫️ Receiving: <b>${u.receiving ? 'ON 🔓' : 'OFF 🔒'}</b>\n` +
     `▫️ Protect content: <b>${u.protect ? 'ON 🛡' : 'OFF'}</b>\n` +
     `▫️ Spoiler reveal: <b>${u.spoiler ? 'ON 👁' : 'OFF'}</b>\n` +
@@ -84,26 +91,29 @@ function menuHTML(u, botUsername) {
     `🔗 <code>${esc(link)}</code>\n\nTap buttons to change settings instantly.`;
 }
 function statsHTML(u) {
-  return `📊 <b>Your AgrrhBot stats</b>\n\n` +
+  return `📊 <b>Your WHoevenYori stats</b>\n\n` +
     `📥 Received: <b>${u.received}</b>\n` +
     `📤 Sent: <b>${u.sent}</b>\n` +
     `🔘 Status: <b>${u.receiving ? 'Receiving 🔓' : 'Paused 🔒'}</b>\n` +
     `🛡 Protect: <b>${u.protect ? 'ON' : 'OFF'}</b> • 👁 Spoiler: <b>${u.spoiler ? 'ON' : 'OFF'}</b>`;
 }
 function helpHTML() {
-  return `❓ <b>How AgrrhBot works</b>\n\n` +
+  return `❓ <b>How WHoevenYori works</b>\n\n` +
     `1️⃣ Share your link. Anyone who opens it can message you <b>anonymously</b>.\n` +
     `2️⃣ You get each message privately. <b>Reply</b> to any message to talk back — still anonymous.\n` +
-    `3️⃣ Conversations are <b>threaded</b>, so it feels like a real chat.\n\n` +
+    `3️⃣ Conversations are <b>threaded</b>, so it feels like a real chat.\n` +
+    `4️⃣ In groups, run <code>/group</code> to let members ask <b>anonymous questions</b>.\n\n` +
     `<b>Commands</b>\n` +
     `/link — your anonymous link\n` +
     `/menu — this panel\n` +
     `/pause · /resume — stop/start receiving\n` +
     `/stats — your numbers\n` +
+    `/group — anonymous Q&A in a group\n` +
     `/wall &lt;text&gt; — post an anonymous confession to the public wall\n` +
     `/cancel — leave anonymous mode\n` +
     `/help — this message\n\n` +
-    `🛡 <b>Protect</b> stops people forwarding your messages. 👁 <b>Spoiler</b> hides them until tapped.`;
+    `🛡 <b>Protect</b> stops people forwarding your messages. 👁 <b>Spoiler</b> hides them until tapped.\n` +
+    `🚩 <b>Report</b> / 🚫 <b>Block</b> any message you receive.`;
 }
 
 // Build delivered text + entities (no parse_mode, so spoiler works cleanly).
@@ -131,6 +141,21 @@ async function handleStart(bot, store, msg) {
   const user = store.getOrCreateUser(cid, from);
   const payload = (msg.text || '/start').trim().split(/\s+/)[1] || null;
 
+  // Group "ask me anything" deep link: ?start=g_<token>
+  if (payload && payload.startsWith('g_')) {
+    const groupId = store.getGroupByToken(payload.slice(2));
+    if (!groupId) { await bot.sendText(cid, '❌ This group link is invalid or expired.'); return; }
+    const g = store.getGroup(groupId);
+    if (!g || !g.active) { await bot.sendText(cid, "🔒 This group's Q&A is currently off."); return; }
+    const panel = await bot.sendText(cid,
+      `🕵️ <b>Anonymous group question</b>\n\n` +
+      `Your question will appear in the group with no name attached. Photos, stickers, voice — all anonymous.\n` +
+      `Tap <b>Cancel</b> when done.`,
+      { parse_mode: 'HTML', reply_markup: composeKeyboard() });
+    store.setGroupSession(cid, { groupId, panelChatId: cid, panelMsgId: panel.message_id });
+    return;
+  }
+
   if (payload) {
     const target = store.getTargetByToken(payload);
     if (!target) { await bot.sendText(cid, '❌ This anonymous link is invalid or expired.'); return; }
@@ -157,10 +182,13 @@ async function handleStart(bot, store, msg) {
   });
 }
 
-// ---- inbound messages (anon send OR owner reply) ----
+// ---- inbound messages: group question OR anon send OR owner reply ----
 async function handleMessage(bot, store, msg, cfg) {
   const cid = chatId(msg);
   if (msg.text && msg.text.startsWith('/')) return; // commands handled separately
+
+  const gSession = store.getGroupSession(cid);
+  if (gSession) return deliverGroupQuestion(bot, store, msg, gSession, cfg);
 
   const session = store.getSession(cid);
   if (session) return deliverFromSender(bot, store, msg, session, cfg);
@@ -176,8 +204,19 @@ async function handleMessage(bot, store, msg, cfg) {
 async function deliverFromSender(bot, store, msg, session, cfg) {
   const cid = chatId(msg);
   const target = store.getUser(session.target);
+
   if (!target || !target.receiving) {
     await editPanel(bot, session, "😶 They're not accepting anonymous messages right now.\nTap <b>Cancel</b> or try later.");
+    return;
+  }
+  if (store.isBlocked(session.target, cid)) {
+    await editPanel(bot, session, "🚫 You've been blocked from messaging this person.");
+    return;
+  }
+  const cls = classifyMessage(msg);
+  const abuse = checkAbuse(cls.kind === 'text' ? cls.text : cls.caption);
+  if (!abuse.ok) {
+    await editPanel(bot, session, '🚫 That message was blocked by the filter (' + abuse.reason + ').');
     return;
   }
   const rate = store.rateCheck(cid, session.target, cfg || {});
@@ -187,7 +226,6 @@ async function deliverFromSender(bot, store, msg, session, cfg) {
   }
 
   const thread = store.getOrCreateThread(session.target, cid);
-  const cls = classifyMessage(msg);
   const replyToOwner = thread.lastOwnerMsgId ? { message_id: thread.lastOwnerMsgId } : undefined;
 
   if (cls.kind === 'text') {
@@ -195,6 +233,8 @@ async function deliverFromSender(bot, store, msg, session, cfg) {
     const sent = await bot.sendText(session.target, c.text, {
       entities: c.entities, protect_content: target.protect, reply_parameters: replyToOwner
     });
+    // attach report/block buttons with the real message id
+    try { await bot.editMarkup(session.target, sent.message_id, reportKeyboard(sent.message_id)); } catch (e) {}
     store.linkMessage(session.target, sent.message_id, thread.id);
     if (msg.message_id) store.linkMessage(cid, msg.message_id, thread.id);
     store.setThreadField(thread.id, 'lastSenderMsgId', sent.message_id);
@@ -208,6 +248,7 @@ async function deliverFromSender(bot, store, msg, session, cfg) {
       ...(target.spoiler && ['photo', 'video', 'animation'].includes(cls.type) ? { has_spoiler: true } : {})
     };
     const sent = await bot.sendMedia(session.target, cls.type, cls.fileId, composeCaption(cls), opts, cls.payload);
+    try { await bot.editMarkup(session.target, sent.message_id, reportKeyboard(sent.message_id)); } catch (e) {}
     store.linkMessage(session.target, sent.message_id, thread.id);
     if (msg.message_id) store.linkMessage(cid, msg.message_id, thread.id);
     store.setThreadField(thread.id, 'lastSenderMsgId', sent.message_id);
@@ -217,6 +258,48 @@ async function deliverFromSender(bot, store, msg, session, cfg) {
   } else {
     await editPanel(bot, session, "🤖 Sorry, I can't forward that type anonymously yet.\nTap <b>Cancel</b>.");
   }
+}
+
+async function deliverGroupQuestion(bot, store, msg, gSession, cfg) {
+  const cid = chatId(msg);
+  const groupId = gSession.groupId;
+  const group = store.getGroup(groupId);
+  if (!group || !group.active) {
+    await editGroupPanel(bot, gSession, "🔒 This group's Q&A is off.");
+    return;
+  }
+  const cls = classifyMessage(msg);
+  const abuse = checkAbuse(cls.kind === 'text' ? cls.text : cls.caption);
+  if (!abuse.ok) {
+    await editGroupPanel(bot, gSession, '🚫 That message was blocked by the filter (' + abuse.reason + '). Tap <b>Cancel</b>.');
+    return;
+  }
+  const rate = store.rateCheck(cid, 'g:' + groupId, cfg || {});
+  if (!rate.ok) {
+    await editGroupPanel(bot, gSession, '🚧 ' + rate.reason + '\nTap <b>Cancel</b> to stop.');
+    return;
+  }
+
+  let sent;
+  if (cls.kind === 'text') {
+    sent = await bot.sendText(groupId, '🕵️ <b>Anonymous question</b>\n\n' + esc(cls.text), { parse_mode: 'HTML', ...NO_PREVIEW });
+  } else if (cls.kind === 'media') {
+    sent = await bot.sendMedia(groupId, cls.type, cls.fileId,
+      '🕵️ <b>Anonymous question</b>' + (cls.caption ? '\n\n' + esc(cls.caption) : ''),
+      { parse_mode: 'HTML', ...NO_PREVIEW }, cls.payload);
+  } else {
+    await editGroupPanel(bot, gSession, "🤖 Sorry, I can't forward that type to the group yet.");
+    return;
+  }
+
+  store.recordGroupQuestion(groupId);
+  if (msg.message_id) await safe(bot.react(cid, msg.message_id, '✅'));
+
+  // Bot API 10.2 ephemeral: a private, auto-deleting confirmation to the asker.
+  await safe(bot.sendText(groupId, '✅ Your anonymous question is live in the group.',
+    { ephemeral_message_parameters: { receiver_user_id: Number(cid) } }));
+
+  await editGroupPanel(bot, gSession, '✅ <b>Posted anonymously!</b> Ask another, or tap <b>Cancel</b>.');
 }
 
 async function deliverOwnerReply(bot, store, msg, threadId) {
@@ -254,6 +337,11 @@ async function editPanel(bot, session, html) {
     await bot.editText(session.panelChatId, session.panelMsgId, html, { parse_mode: 'HTML', reply_markup: composeKeyboard() });
   } catch (e) { /* message too old to edit — ignore */ }
 }
+async function editGroupPanel(bot, gSession, html) {
+  try {
+    await bot.editText(gSession.panelChatId, gSession.panelMsgId, html, { parse_mode: 'HTML', reply_markup: composeKeyboard() });
+  } catch (e) { /* ignore */ }
+}
 
 // ---- commands ----
 async function handleMenu(bot, store, msg) {
@@ -280,9 +368,9 @@ async function handleResume(bot, store, msg) {
 }
 async function handleCancel(bot, store, msg) {
   const cid = chatId(msg);
-  const s = store.getSession(cid);
+  const s = store.getSession(cid) || store.getGroupSession(cid);
   if (s) {
-    store.clearSession(cid);
+    store.clearSession(cid); store.clearGroupSession(cid);
     await editPanel(bot, s, "🚪 You've left anonymous mode. Open someone's link to message them.");
   } else {
     await bot.sendText(cid, "🚪 You're not in anonymous mode right now.");
@@ -319,6 +407,27 @@ async function handleWall(bot, store, msg, cfg) {
   }
   await bot.sendText(cid, '🧱 Posted to the public wall <b>anonymously</b>! 🎉', { parse_mode: 'HTML' });
 }
+async function handleGroup(bot, store, msg) {
+  const cid = chatId(msg);
+  const type = msg.chat && msg.chat.type;
+  if (type !== 'group' && type !== 'supergroup') {
+    await bot.sendText(cid, '🕵️ The anonymous Q&A works inside a <b>group</b>. Add me to a group and run <code>/group</code> there.', { parse_mode: 'HTML' });
+    return;
+  }
+  const arg = (msg.text || '').split(/\s+/)[1] || '';
+  if (arg === 'off') { store.setGroupActive(cid, false); await bot.sendText(cid, '🔒 Anonymous Q&A turned <b>off</b> for this group.', { parse_mode: 'HTML' }); return; }
+  if (arg === 'on') { store.setGroupActive(cid, true); await bot.sendText(cid, '🔓 Anonymous Q&A turned <b>on</b> for this group.', { parse_mode: 'HTML' }); return; }
+  if (arg === 'stats') { const g = store.getGroup(cid); await bot.sendText(cid, `📊 This group has received <b>${g ? g.questions : 0}</b> anonymous questions.`, { parse_mode: 'HTML' }); return; }
+
+  const token = store.getOrCreateGroup(cid);
+  store.setGroupActive(cid, true);
+  const link = `https://t.me/${bot.username}?start=g_${token}`;
+  await bot.sendText(cid,
+    `🕵️ <b>Anonymous Q&A is live!</b>\n\n` +
+    `Tap the button to ask the group anything — your name stays hidden. Questions appear here with no author.\n\n` +
+    `Admins: turn it off with <code>/group off</code>.`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🕵️ Ask anonymously', url: link }]] }, ...NO_PREVIEW });
+}
 
 // ---- callback queries (smooth in-place UI) ----
 async function handleCallback(bot, store, cb, cfg) {
@@ -328,6 +437,9 @@ async function handleCallback(bot, store, cb, cfg) {
   if (!chatIdStr || !fromId) return;
   const u = store.getOrCreateUser(fromId, { username: cb.from.username, firstName: cb.from.first_name });
 
+  if (data.startsWith('report:') || data.startsWith('block:')) {
+    return handleReportBlock(bot, store, cb, cfg, data, fromId, chatIdStr);
+  }
   if (data === 'idea') {
     try {
       await bot.editText(chatIdStr, cb.message.message_id,
@@ -338,9 +450,13 @@ async function handleCallback(bot, store, cb, cfg) {
     return;
   }
   if (data === 'cancel') {
-    const s = store.getSession(fromId);
-    if (s) { store.clearSession(fromId); try { await bot.editText(chatIdStr, cb.message.message_id, "🚪 You've left anonymous mode."); } catch (e) {} }
-    else { try { await bot.editText(chatIdStr, cb.message.message_id, '🚪 Nothing to cancel.'); } catch (e) {} }
+    const s = store.getSession(fromId) || store.getGroupSession(fromId);
+    if (s) {
+      store.clearSession(fromId); store.clearGroupSession(fromId);
+      try { await bot.editText(chatIdStr, cb.message.message_id, "🚪 You've left anonymous mode."); } catch (e) {}
+    } else {
+      try { await bot.editText(chatIdStr, cb.message.message_id, '🚪 Nothing to cancel.'); } catch (e) {}
+    }
     await bot.answerCb(cb.id, { text: '🚪' });
     return;
   }
@@ -375,6 +491,30 @@ async function handleCallback(bot, store, cb, cfg) {
       await bot.answerCb(cb.id, { text: '?' });
   }
 }
+
+async function handleReportBlock(bot, store, cb, cfg, data, owner, chatIdStr) {
+  const msgId = Number(data.split(':')[1]);
+  const threadId = store.threadByLink(owner, msgId);
+  if (!threadId) { await bot.answerCb(cb.id, { text: '⚠️ Already handled or expired' }); return; }
+  const thread = store.getThread(threadId);
+  if (data.startsWith('report:')) {
+    store.addReport({ owner, sender: thread.sender, threadId, text: '(see message)' });
+    store.block(owner, thread.sender);
+    await safe(bot.react(owner, msgId, '🚩'));
+    await safe(bot.editMarkup(owner, msgId, { inline_keyboard: [] }));
+    if (cfg && cfg.adminId) {
+      await safe(bot.sendText(cfg.adminId,
+        `🚩 Report @${esc(bot.username)}\nOwner: ${owner}\nThread: ${threadId}\nSender: ${thread.sender}`,
+        { parse_mode: 'HTML' }));
+    }
+    await bot.answerCb(cb.id, { text: '🚩 Reported & sender blocked' });
+  } else {
+    store.block(owner, thread.sender);
+    await safe(bot.editMarkup(owner, msgId, { inline_keyboard: [] }));
+    await bot.answerCb(cb.id, { text: '🚫 Sender blocked' });
+  }
+}
+
 async function renderMenu(bot, cb, u) {
   try {
     await bot.editText(cb.message.chat.id, cb.message.message_id, menuHTML(u, bot.username),
@@ -400,8 +540,8 @@ async function handleInline(bot, store, query) {
 
 module.exports = {
   handleStart, handleMessage, handleMenu, handleLink, handleStats, handlePause, handleResume,
-  handleCancel, handleHelp, handleWall, handleCallback, handleInline,
+  handleCancel, handleHelp, handleWall, handleGroup, handleCallback, handleInline,
   // exported for tests
   linkFor, composeDelivered, composeReply, menuHTML, welcomeHTML, statsHTML, helpHTML,
-  menuKeyboard, shareKeyboard, composeKeyboard, esc
+  menuKeyboard, shareKeyboard, composeKeyboard, reportKeyboard, esc
 };

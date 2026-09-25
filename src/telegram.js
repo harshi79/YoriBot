@@ -56,6 +56,7 @@ function buildBot(token) {
   const store = new Store();
   const cfg = {
     channelId: config.CHANNEL_ID,
+    adminId: config.ADMIN_ID,
     globalPerHour: config.GLOBAL_PER_HOUR,
     pairPerHour: config.PAIR_PER_HOUR,
     minIntervalMs: config.MIN_INTERVAL_MS
@@ -74,6 +75,7 @@ function buildBot(token) {
   bot.command('menu', (ctx) => { const m = M(ctx); if (m) return engine.handleMenu(adapter, store, m); });
   bot.command('cancel', (ctx) => { const m = M(ctx); if (m) return engine.handleCancel(adapter, store, m); });
   bot.command('help', (ctx) => { const m = M(ctx); if (m) return engine.handleHelp(adapter, store, m); });
+  bot.command('group', (ctx) => { const m = M(ctx); if (m) return engine.handleGroup(adapter, store, m); });
   bot.command('wall', (ctx) => { const m = M(ctx); if (m) return engine.handleWall(adapter, store, m, cfg); });
 
   bot.on('message', (ctx) => { const m = M(ctx); if (m) return engine.handleMessage(adapter, store, m, cfg); });
@@ -89,6 +91,7 @@ function buildBot(token) {
       { command: 'resume', description: 'Start receiving messages' },
       { command: 'stats', description: 'Your anonymous stats' },
       { command: 'wall', description: 'Post an anonymous confession' },
+      { command: 'group', description: 'Anonymous Q&A in a group' },
       { command: 'cancel', description: 'Leave anonymous mode' },
       { command: 'help', description: 'How it works' }
     ]
