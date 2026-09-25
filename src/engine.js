@@ -10,8 +10,10 @@
  *   bot.username
  *   bot.sendText(chatId, text, opts)                      -> Message
  *   bot.sendMedia(chatId, type, fileId, caption, opts, payload) -> Message
- *   bot.sendRich(chatId, html, opts)                      -> Message   (10.1, optional)
+ *   bot.sendRich(chatId, htmlOrBlocks, opts)              -> Message   (10.1+, optional)
  *   bot.editText(chatId, messageId, text, opts)
+ *   bot.editRich(chatId, messageId, htmlOrBlocks, opts)                (optional)
+ *   bot.editMedia(chatId, messageId, type, fileId, caption, opts)      (optional)
  *   bot.editMarkup(chatId, messageId, replyMarkup)
  *   bot.editInline(inlineMessageId, text, opts)                        (optional)
  *   bot.editEphemeral(chatId, receiverUserId, ephemeralMessageId, text, opts) (optional)
@@ -30,7 +32,7 @@ const { classifyMessage, hasMedia, chatActionFor } = require('./media');
 const { checkAbuse } = require('./filter');
 const { classifyError, KINDS, bestEffort } = require('./errors');
 const { SIGNAL, FLAVOUR, reactionOf } = require('./reactions');
-const { sendRichOrText } = require('./rich');
+const { sendRichOrText, editRichOrText } = require('./rich');
 const whisper = require('./whisper');
 const ui = require('./ui');
 
@@ -50,6 +52,9 @@ const chatId = (msg) => String(msg.chat.id);
 const actor = (msg) => (msg && msg.from && msg.from.id != null ? String(msg.from.id) : chatId(msg));
 const isGroup = (msg) => whisper.isGroupChat(msg.chat && msg.chat.type);
 const label = (from) => (from ? (from.first_name || from.username || String(from.id)) : 'Someone');
+const inlineOpenLocks = new Set(); // avoid duplicate one-time deliveries on simultaneous /start
+const requiresPrivateReveal = (w) => !!(w && w.chatType === 'inline' &&
+  (w.inlinePrepared || w.media || !ui.whisperAlertFits(w)));
 
 const IDEAS = [
   'One thing you would change about the world?',
@@ -100,7 +105,12 @@ async function editPanel(bot, store, ref, html, opts = {}) {
     if (kind === KINDS.UNEDITABLE || kind === KINDS.NOT_FOUND) {
       // Too old / deleted: re-create it and hand the new reference back.
       try {
-        const fresh = await bot.sendText(ref.chatId, html, opts);
+        // An expired private panel must NEVER be recreated as a public group
+        // message. If ephemeral delivery has stopped working, fail closed.
+        const sendOpts = ref.ephemeralId
+          ? { ...opts, ephemeral_message_parameters: { receiver_user_id: Number(ref.receiverId) } }
+          : opts;
+        const fresh = await bot.sendText(ref.chatId, html, sendOpts);
         return { recreated: panelOf(fresh, { chat: { id: ref.chatId } }, ref.receiverId) };
       } catch { return false; }
     }
@@ -129,7 +139,7 @@ async function editSessionPanel(bot, store, session, html, opts = {}) {
       panelReceiverId: r.recreated.receiverId
     };
     if (session.kind === 'group') store.setGroupSession(session.senderId || ref.chatId, next);
-    else if (session.kind === 'whisper_target' || session.kind === 'whisper_body') store.setWhisperSession(session.senderId, next);
+    else if (session.kind === 'whisper_target' || session.kind === 'whisper_body' || session.kind === 'inline_media') store.setWhisperSession(session.senderId, next);
     else store.setSession(session.senderId || ref.chatId, next);
   }
   return r;
@@ -137,10 +147,10 @@ async function editSessionPanel(bot, store, session, html, opts = {}) {
 
 /**
  * Reply that only the caller can see, when the chat supports ephemeral messages
- * (Bot API 10.2+). Falls back to a normal reply everywhere else, and latches the
- * capability per chat so we stop trying where it cannot work.
+ * (Bot API 10.2+). For private-only content, fall back to a DM, never a public
+ * group message. Generic notices can fall back to a normal group reply.
  */
-async function privateReply(bot, store, msg, html, opts = {}) {
+async function privateReply(bot, store, msg, html, opts = {}, privateOnly = false) {
   const from = msg.from;
   if (isGroup(msg) && from && from.id != null && store.chatCap(chatId(msg), 'ephemeral') !== false) {
     try {
@@ -155,6 +165,16 @@ async function privateReply(bot, store, msg, html, opts = {}) {
       const kind = classifyError(err).kind;
       if (kind === KINDS.CAPABILITY || kind === KINDS.FORBIDDEN) store.setChatCap(chatId(msg), 'ephemeral', false);
     }
+  }
+  if (privateOnly && isGroup(msg)) {
+    if (from && from.id != null) {
+      try {
+        const sent = await bot.sendText(from.id, html, { parse_mode: 'HTML', ...NO_PREVIEW, ...opts });
+        return { sent, private: true, dm: true };
+      } catch { /* recipient has not opened the bot; fail closed */ }
+    }
+    await safe(bot.sendText(chatId(msg), '🔒 Open my private chat to use that command.'), 'private-command-hint');
+    return { sent: null, private: false };
   }
   return { sent: await bot.sendText(chatId(msg), html, { parse_mode: 'HTML', ...NO_PREVIEW, ...opts }), private: false };
 }
@@ -182,6 +202,86 @@ async function openPanel(bot, store, msg, html, markup) {
   return panelOf(sent, msg, from && from.id);
 }
 
+// ------------------------------------------- private reveal for inline cards
+
+async function handleInlinePrivateStart(bot, store, msg, id) {
+  const cid = chatId(msg);
+  const uid = actor(msg);
+  // /start payloads can be pasted into groups. Never send a secret there.
+  if (!msg.chat || msg.chat.type !== 'private' || cid !== uid) {
+    await bot.sendText(cid, '🔒 Open this bot in a <b>private chat</b> to view a locked whisper.', { parse_mode: 'HTML' });
+    return;
+  }
+  const w = store.getWhisper(id);
+  if (!requiresPrivateReveal(w)) {
+    await bot.sendText(cid, '⌛ This private whisper link is invalid or expired.');
+    return;
+  }
+  if (inlineOpenLocks.has(w.id)) return; // concurrent /start must not deliver a one-time file twice
+  inlineOpenLocks.add(w.id);
+  try {
+    const access = await whisper.checkWhisperAccess(bot, store, w, msg.from);
+    if (!access.allowed) {
+      await bot.sendText(cid, access.peek ? '🔒 This whisper is not for you.' : (access.toast || '⌛ Whisper unavailable.'));
+      return;
+    }
+
+    const html = ui.whisperDmHTML(w) + (w.oneTime ? '\n\n🔥 This view is deleted in 30 seconds.' : '');
+    const markup = w.oneTime ? undefined : ui.whisperOpenKeyboard(w, false);
+    const commonOpts = { parse_mode: 'HTML', reply_markup: markup };
+    const oldMid = w.dmMessageIds && w.dmMessageIds[uid];
+    let mid = oldMid;
+    let edited = false;
+    if (oldMid) {
+      try {
+        if (w.media && typeof bot.editMedia === 'function') {
+          await bot.editMedia(cid, oldMid, w.media.type, w.media.fileId, html, {
+            ...commonOpts,
+            ...(['photo', 'video', 'animation'].includes(w.media.type) ? { has_spoiler: true } : {})
+          });
+          edited = true;
+        } else if (!w.media) {
+          await bot.editText(cid, oldMid, html, { ...commonOpts, ...NO_PREVIEW });
+          edited = true;
+        }
+      } catch { /* deleted / too old — send a fresh private message below */ }
+    }
+    if (!edited) {
+      let sent;
+      if (w.media) {
+        sent = await bot.sendMedia(cid, w.media.type, w.media.fileId, html, {
+          ...commonOpts, protect_content: true,
+          ...(['photo', 'video', 'animation'].includes(w.media.type) ? { has_spoiler: true } : {})
+        }, w.media.payload);
+      } else {
+        sent = await bot.sendText(cid, html, { ...commonOpts, ...NO_PREVIEW, protect_content: true });
+      }
+      mid = sent && sent.message_id;
+    }
+
+    whisper.bindRecipient(store, w, msg.from);
+    const firstRead = !w.openedBy.includes(uid);
+    store.recordOpen(w.id, uid);
+    if (firstRead) store.recordWhisperGot(uid);
+    if (w.oneTime) {
+      if (mid) store.scheduleDelete(cid, mid, 30000);
+      // Don't store this DM id in dmMessageIds: burnWhisper would delete it
+      // immediately, before the recipient gets a chance to see the photo.
+      await whisper.burnWhisper(bot, store, w, 'read once');
+    } else {
+      store.updateWhisper(w.id, { dmMessageIds: { ...w.dmMessageIds, [uid]: mid } });
+      await safe(whisper.editCard(bot, w, ui.whisperCardHTML(w), {
+        parse_mode: 'HTML', ...NO_PREVIEW, reply_markup: ui.whisperKeyboard(w, false)
+      }), 'inline-private-open-edit');
+    }
+  } catch (err) {
+    if (process.env.DEBUG_BOT) console.warn('[inline-private]', classifyError(err).description);
+    await safe(bot.sendText(cid, '🚫 The private whisper could not be delivered. Please try opening the card again.'), 'inline-private-failed');
+  } finally {
+    inlineOpenLocks.delete(w.id);
+  }
+}
+
 // ------------------------------------------------------------------- /start
 
 async function handleStart(bot, store, msg) {
@@ -190,6 +290,11 @@ async function handleStart(bot, store, msg) {
   const from = msg.from || {};
   const user = store.getOrCreateUser(uid, { username: from.username, firstName: from.first_name });
   const payload = (msg.text || '/start').trim().split(/\s+/)[1] || null;
+
+  if (payload && /^wm_[a-f0-9]{12}$/i.test(payload)) {
+    await handleInlinePrivateStart(bot, store, msg, payload.slice(3).toLowerCase());
+    return;
+  }
 
   // ---- group "ask me anything" deep link: ?start=g_<token>
   if (payload && payload.startsWith('g_')) {
@@ -259,6 +364,7 @@ async function handleMessage(bot, store, msg, cfg) {
   const wSession = store.getWhisperSession(uid);
   if (wSession && wSession.kind === 'whisper_target') return whisperStepTarget(bot, store, msg, cfg, wSession);
   if (wSession && wSession.kind === 'whisper_body') return whisperStepBody(bot, store, msg, cfg, wSession);
+  if (wSession && wSession.kind === 'inline_media') return whisperStepInlineMedia(bot, store, msg, cfg, wSession);
 
   const session = store.getSession(uid);
 
@@ -500,11 +606,80 @@ async function deliverGroupQuestion(bot, store, msg, gSession, cfg) {
 
 // ------------------------------------------------------------- whisper flow
 
+const INLINE_PRIVATE_MEDIA = new Set(['photo', 'video', 'animation', 'document']);
+
+/** /wi @alice [caption] [0] — stage a private photo for an inline locked card. */
+async function handleInlineMedia(bot, store, msg, cfg) {
+  const cid = chatId(msg);
+  const from = msg.from || {};
+  const uid = actor(msg);
+  if (!msg.chat || msg.chat.type !== 'private') {
+    await privateReply(bot, store, msg, '🖼 Start <code>/wi @username</code> in my private chat, then send me the photo there. Never post a private image directly into the group.');
+    return;
+  }
+  const input = (msg.text || '').split(/\s+/).slice(1).join(' ');
+  const parsed = whisper.parseInlineWhisperInput(input, store, { maxTargets: 1 });
+  if (parsed.targets.length !== 1 || parsed.unknown.length) {
+    await bot.sendText(cid,
+      '🖼 <b>Private inline media</b>\n\nUse <code>/wi @alice</code> or <code>/wi 123456789 0</code> (final 0 hides your name on the card).\nThen send me a photo, video, GIF or document in this DM.',
+      { parse_mode: 'HTML', ...NO_PREVIEW });
+    return;
+  }
+  store.getOrCreateUser(uid, { username: from.username, firstName: from.first_name });
+  const sent = await bot.sendText(cid, ui.inlineMediaComposeHTML(whisper.targetLabel(parsed.targets)), {
+    parse_mode: 'HTML', ...NO_PREVIEW,
+    reply_markup: { inline_keyboard: [[{ text: '🚪 Cancel', callback_data: 'cancel' }]] }
+  });
+  store.setWhisperSession(uid, {
+    kind: 'inline_media', senderId: uid, targets: parsed.targets, flags: parsed.flags,
+    introText: parsed.text, panelChatId: cid, panelMsgId: sent && sent.message_id
+  });
+}
+
+/** The file stays in the DM; only a text-only, target-locked inline card is shared. */
+async function whisperStepInlineMedia(bot, store, msg, cfg, session) {
+  const uid = actor(msg);
+  const cls = classifyMessage(msg);
+  const panel = (html) => editSessionPanel(bot, store, session, html, {
+    parse_mode: 'HTML', ...NO_PREVIEW,
+    reply_markup: { inline_keyboard: [[{ text: '🚪 Cancel', callback_data: 'cancel' }]] }
+  });
+  if (cls.kind !== 'media' || !INLINE_PRIVATE_MEDIA.has(cls.type) || !cls.fileId) {
+    await panel('🖼 Send a <b>photo, video, GIF or document</b> here in this private chat. The file will never appear in the public inline card.');
+    return;
+  }
+  const caption = cls.caption || session.introText || '';
+  if (caption.length > 800) {
+    await panel('🚧 Keep the private caption under 800 characters, then send the media again.');
+    return;
+  }
+  const abuse = checkAbuse(caption);
+  if (!abuse.ok) { await panel('🚫 That caption was blocked by the abuse filter. Try another caption.'); return; }
+  const recipient = session.targets[0].userId || session.targets[0].key;
+  const rate = store.rateCheck(uid, `w:${recipient}`, cfg || {});
+  if (!rate.ok) { await panel('🚧 ' + esc(rate.reason)); return; }
+
+  const from = msg.from || {};
+  const w = whisper.createWhisper(store, { whisperTtlMs: cfg && cfg.whisperTtlMs }, {
+    chatId: null, chatType: 'inline', chatTitle: null,
+    fromId: uid, fromLabel: from.username ? '@' + from.username : label(from),
+    targets: session.targets, text: caption, flags: session.flags,
+    classified: cls, inlinePrepared: true
+  });
+  store.clearWhisperSession(uid);
+  await editPanel(bot, store, {
+    chatId: session.panelChatId, messageId: session.panelMsgId,
+    ephemeralId: session.panelEphemeralId, receiverId: session.panelReceiverId
+  }, ui.inlineMediaReadyHTML(w), {
+    parse_mode: 'HTML', ...NO_PREVIEW, reply_markup: ui.inlineMediaShareKeyboard(w)
+  });
+}
+
 /*
  * Three ways in:
  *   /w @alice secret          one-shot
  *   /w                        guided (target, then body — supports media)
- *   @bot @alice secret        inline, in ANY chat
+ *   @bot @alice secret [0]    inline in ANY chat; final 0 hides the bot's sender label
  */
 async function handleWhisper(bot, store, msg, cfg) {
   const cid = chatId(msg);
@@ -698,7 +873,7 @@ async function handleReply(bot, store, msg, cfg, rawText) {
 async function handleWhispers(bot, store, msg) {
   const uid = actor(msg);
   const list = store.whispersFor(uid).map((w) => ({ ...w }));
-  await privateReply(bot, store, msg, ui.whisperListHTML(list, uid));
+  await privateReply(bot, store, msg, ui.whisperListHTML(list, uid), {}, true);
 }
 
 /** `/id` — your numeric user id (private, so nobody else in the group learns it). */
@@ -707,7 +882,7 @@ async function handleId(bot, store, msg) {
   const from = msg.from || {};
   store.getOrCreateUser(uid, { username: from.username, firstName: from.first_name });
   await privateReply(bot, store, msg,
-    `🆔 <b>Your user id</b>\n\n<code>${esc(uid)}</code>\n\nUse it to whisper people who have no username:\n<code>/w ${esc(uid)} your secret</code>`);
+    `🆔 <b>Your user id</b>\n\n<code>${esc(uid)}</code>\n\nUse it to whisper people who have no username:\n<code>/w ${esc(uid)} your secret</code>`, {}, true);
 }
 
 // ------------------------------------------------------------------ commands
@@ -719,7 +894,7 @@ async function handleMenu(bot, store, msg) {
   const u = store.getOrCreateUser(uid, { username: from.username, firstName: from.first_name });
   const html = ui.menuHTML(u, bot.username, bot.name || bot.username);
   if (isGroup(msg)) {
-    const r = await privateReply(bot, store, msg, html, { reply_markup: ui.menuKeyboard(u) });
+    const r = await privateReply(bot, store, msg, html, { reply_markup: ui.menuKeyboard(u) }, true);
     store.setPanel(uid, r.sent && (r.sent.ephemeral_message_id || r.sent.message_id));
     return;
   }
@@ -733,13 +908,13 @@ async function handleLink(bot, store, msg) {
   const link = linkFor(bot.username, u.token);
   await privateReply(bot, store, msg,
     `🔗 <b>Your anonymous link</b>\n\n<code>${esc(link)}</code>\n\nShare it anywhere — whoever opens it can message you with no name attached.`,
-    { reply_markup: ui.shareKeyboard(link) });
+    { reply_markup: ui.shareKeyboard(link) }, true);
 }
 
 async function handleStats(bot, store, msg) {
   const from = msg.from || {};
   const u = store.getOrCreateUser(actor(msg), { username: from.username, firstName: from.first_name });
-  await privateReply(bot, store, msg, ui.statsHTML(u));
+  await privateReply(bot, store, msg, ui.statsHTML(u), {}, true);
 }
 
 async function handlePause(bot, store, msg) {
@@ -870,15 +1045,9 @@ async function handleGroup(bot, store, msg) {
 const isAdmin = (cfg, id) => !!(cfg && cfg.adminIds && cfg.adminIds.length &&
   cfg.adminIds.map(String).includes(String(id)));
 
-async function handleAdmin(bot, store, msg, cfg) {
-  const cid = chatId(msg);
-  const from = msg.from || {};
-  if (!isAdmin(cfg, from.id)) {
-    await bot.sendText(cid, '🛠 This panel is for the bot admin only.');
-    return;
-  }
+function adminStats(bot, store, cfg) {
   const c = store.counters();
-  await bot.sendText(cid, ui.adminHTML({
+  return {
     users: store.userCount(),
     anonReceived: c.anonReceived || 0,
     whispers: c.whispersSent || 0,
@@ -891,7 +1060,46 @@ async function handleAdmin(bot, store, msg, cfg) {
     transport: (cfg && cfg.transport) || '?',
     rich: bot.richGate ? (bot.richGate.enabled ? 'on' : 'off') : 'off',
     uptime: cfg && cfg.uptime ? cfg.uptime() : '?'
-  }), { parse_mode: 'HTML', ...NO_PREVIEW, reply_markup: ui.adminKeyboard() });
+  };
+}
+
+/** One dashboard per admin: rich table when supported, classic HTML otherwise. */
+async function renderAdminDashboard(bot, store, cfg, uid, messageId) {
+  const stats = adminStats(bot, store, cfg);
+  const spec = {
+    rich: ui.adminRichMessage(stats), html: ui.adminHTML(stats), gate: bot.richGate,
+    opts: { parse_mode: 'HTML', ...NO_PREVIEW, reply_markup: ui.adminKeyboard() }
+  };
+  const key = `admin:${uid}`;
+  const mid = messageId || store.getPanel(key);
+  if (mid) {
+    try {
+      await editRichOrText(bot, uid, mid, spec);
+      store.setPanel(key, mid);
+      return;
+    } catch (err) {
+      const kind = classifyError(err).kind;
+      if (kind === KINDS.NOT_MODIFIED) return;
+      if (kind !== KINDS.UNEDITABLE && kind !== KINDS.NOT_FOUND) throw err;
+      // Deleted/uneditable: create just one fresh panel and remember its id.
+    }
+  }
+  const sent = await sendRichOrText(bot, uid, spec);
+  if (sent && sent.message_id) store.setPanel(key, sent.message_id);
+}
+
+async function handleAdmin(bot, store, msg, cfg) {
+  const cid = chatId(msg);
+  const from = msg.from || {};
+  if (!isAdmin(cfg, from.id)) {
+    await bot.sendText(cid, '🛠 This panel is for the bot admin only.');
+    return;
+  }
+  if (cid !== String(from.id)) {
+    await bot.sendText(cid, '🛠 For privacy, open this bot in a DM and send /admin there.');
+    return;
+  }
+  await renderAdminDashboard(bot, store, cfg, cid);
 }
 
 // ------------------------------------------------------- callback queries
@@ -906,6 +1114,20 @@ async function handleCallback(bot, store, cb, cfg) {
 
   const store1 = store.getOrCreateUser(fromId, { username: from.username, firstName: from.first_name });
 
+  if (data.startsWith('wi_discard:')) {
+    const w = store.getWhisper(data.slice('wi_discard:'.length));
+    if (!w || !w.inlinePrepared || w.fromId !== fromId || w.status !== 'active') {
+      await safe(bot.answerCb(cb.id, { text: '🗑 Not your draft' }), 'wi-discard-denied');
+      return;
+    }
+    await whisper.burnWhisper(bot, store, w, 'discarded by its sender');
+    if (accessible(cb)) await editPanel(bot, store,
+      { chatId: String(cb.message.chat.id), messageId: cb.message.message_id },
+      '🗑 <b>Private media draft discarded.</b>', { parse_mode: 'HTML' });
+    await safe(bot.answerCb(cb.id, { text: '🗑 Discarded' }), 'wi-discard');
+    return;
+  }
+
   // ---- whisper callbacks (these answer with the secret, so they go first) ----
   if (data.startsWith('w_open:') || data.startsWith('w_burn:') ||
       data.startsWith('w_delete:') || data.startsWith('w_reply:')) {
@@ -918,7 +1140,22 @@ async function handleCallback(bot, store, cb, cfg) {
   }
   const cid = String(cb.message.chat.id);
   const mid = cb.message.message_id;
-  const panelRef = { chatId: cid, messageId: mid };
+  const eid = cb.message.ephemeral_message_id;
+  const panelRef = eid
+    ? { chatId: cid, ephemeralId: eid, receiverId: Number(fromId) }
+    : { chatId: cid, messageId: mid };
+  // Older public group panels, forwarded buttons and fallback panels must
+  // never edit a user's history, link or settings into the public transcript.
+  const personalPanelData = new Set(['pause', 'resume', 'protect', 'spoiler', 'autodelete',
+    'silent', 'stats', 'whispers', 'blocked', 'link', 'menu', 'refresh', 'help']);
+  if (cid !== fromId && !eid && personalPanelData.has(data)) {
+    await safe(bot.answerCb(cb.id, { text: '🔒 Open my DM for your private panel.' }), 'private-panel-hint');
+    return;
+  }
+  if (eid && cb.message.receiver_user && String(cb.message.receiver_user.id) !== fromId) {
+    await safe(bot.answerCb(cb.id, { text: '🔒 Not your panel.' }), 'private-panel-owner');
+    return;
+  }
 
   // ---- report / block / burn / reply on a delivered anonymous message ----
   if (data.startsWith('report:') || data.startsWith('block:') ||
@@ -1024,8 +1261,9 @@ async function handleCallback(bot, store, cb, cfg) {
       await editPanel(bot, store, panelRef,
         '🤫 <b>Whispering</b>\n\nIn a group: <code>/w @alice your secret</code>\n' +
         'Only Alice sees it — everyone else sees nothing at all.\n\n' +
-        'Anywhere: <code>@' + esc(bot.username) + ' @alice your secret</code>\n' +
-        'She answers with <code>/r her reply</code>, also invisible.\n\n' +
+        'Anywhere: <code>@' + esc(bot.username) + ' @alice your secret</code> (shows sender → recipient).\n' +
+        'Add a final <code>0</code> to hide the sender label — Telegram still shows who posted the inline message.\n' +
+        'For group <code>/w</code> whispers, she can answer with <code>/r her reply</code> when the bot knows both user ids. Inline cards reveal via the Open button.\n\n' +
         'Flags: <code>!1</code> burn after reading · <code>!5m</code> expire · <code>!nosender</code> · <code>!sign</code>',
         { parse_mode: 'HTML', ...NO_PREVIEW, reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'menu' }]] } });
       return;
@@ -1057,17 +1295,20 @@ async function renderMenu(bot, store, ref, u, botName) {
 }
 
 async function handleAdminCallback(bot, store, cb, cfg, data, fromId, cid, mid) {
-  if (!isAdmin(cfg, fromId)) { await safe(bot.answerCb(cb.id, { text: '🛠 admin only' }), 'cb-admin'); return; }
+  if (!isAdmin(cfg, fromId) || cid !== fromId) {
+    await safe(bot.answerCb(cb.id, { text: '🛠 Open /admin in the bot DM' }), 'cb-admin'); return;
+  }
   if (data === 'admin:reports') {
     const reports = store.getReports(8).reverse();
     const html = reports.length
       ? '🚩 <b>Last reports</b>\n\n' + reports.map((r) =>
         `• owner <code>${esc(r.owner)}</code> ← sender <code>${esc(r.sender)}</code> · ${esc(r.reason || '')}`).join('\n')
       : '🚩 No reports yet.';
-    await editPanel(bot, store, { chatId: cid, messageId: mid }, html,
+    const result = await editPanel(bot, store, { chatId: cid, messageId: mid }, html,
       { parse_mode: 'HTML', ...NO_PREVIEW, reply_markup: ui.adminKeyboard() });
+    if (result) store.setPanel(`admin:${fromId}`, result.recreated ? result.recreated.messageId : mid);
   } else {
-    await handleAdmin(bot, store, { chat: { id: cid }, from: { id: fromId } }, cfg);
+    await renderAdminDashboard(bot, store, cfg, fromId, mid);
   }
   await safe(bot.answerCb(cb.id, { text: '🛠' }), 'cb-admin-ok');
 }
@@ -1134,6 +1375,24 @@ async function handleWhisperCallback(bot, store, cb, cfg, data, fromId, user) {
   const w = store.getWhisper(id);
 
   if (action === 'w_open') {
+    if (requiresPrivateReveal(w)) {
+      if (cb.inline_message_id && !w.inlineMessageId) store.updateWhisper(w.id, { inlineMessageId: cb.inline_message_id });
+      const access = await whisper.checkWhisperAccess(bot, store, w, cb.from);
+      if (!access.allowed) {
+        await safe(bot.answerCb(cb.id, { text: access.alert || access.toast, show_alert: !!access.alert }), 'cb-open-denied');
+        return;
+      }
+      // Inline callbacks carry an inline_message_id, NOT a chat_id. Opening a
+      // bot DM with an authenticated deep link is the only way to show media
+      // without making the photo public to everyone in the original chat.
+      const url = `https://t.me/${bot.username}?start=wm_${w.id}`;
+      try {
+        await bot.answerCb(cb.id, { url });
+      } catch {
+        await safe(bot.answerCb(cb.id, { text: `Open @${bot.username} privately and send /start wm_${w.id}`, show_alert: true }), 'cb-open-link');
+      }
+      return;
+    }
     const r = await whisper.revealWhisper(bot, store, w, cb.from);
     await safe(bot.answerCb(cb.id, r.allowed ? { text: r.alert, show_alert: true } : { text: r.alert || r.toast, show_alert: !!r.alert }), 'cb-open');
     return;
@@ -1165,11 +1424,30 @@ async function handleWhisperCallback(bot, store, cb, cfg, data, fromId, user) {
  * `@bot …` in any chat. Two jobs:
  *   • no targets  -> your share card (the viral loop)
  *   • with target -> a locked whisper card, droppable into ANY chat, even one
- *     the bot has never been added to.
+ *     the bot has never been added to. Inline cards name the sender by default;
+ *     a standalone final 0 leaves their name off the card and reveal.
+ * Telegram still shows who posted an inline message, even with the 0 switch.
  * Whisper answers are always `is_personal` with `cache_time: 0`: Telegram caches
  * inline results per query otherwise, and a cached whisper card would be shown
  * to the wrong person.
  */
+function inlineWhisperResult(w) {
+  const privateOpen = w.inlinePrepared || !ui.whisperAlertFits(w);
+  return {
+    type: 'article', id: w.id,
+    title: `🤫 Whisper to ${w.targetLabel} · ${w.signed ? 'from ' + w.fromLabel : 'no sender label'}`,
+    description: w.inlinePrepared ? '🖼 Private media — only a text-only card is posted'
+      : privateOpen ? '📖 Full message opens privately in the bot'
+        : w.signed ? `🔒 ${w.text.slice(0, 90)}`
+          : `⚠️ Telegram shows who posts inline messages · 🔒 ${w.text.slice(0, 45)}`,
+    input_message_content: {
+      message_text: ui.whisperCardHTML(w), parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true }
+    },
+    reply_markup: ui.whisperKeyboard(w, false)
+  };
+}
+
 async function handleInline(bot, store, query, cfg) {
   const from = query.from || {};
   const fromId = from.id != null ? String(from.id) : null;
@@ -1178,7 +1456,20 @@ async function handleInline(bot, store, query, cfg) {
   const link = linkFor(bot.username, u.token);
   const raw = String(query.query || '');
 
-  const parsed = whisper.parseWhisperInput(raw, store, { maxTargets: cfg ? cfg.maxWhisperTargets : 5 });
+  // /wi prepares media in a DM; its inline query only exposes a locked article.
+  // Never return the underlying photo as an InlineQueryResultPhoto: that would
+  // post it to the entire chat, even with has_spoiler enabled.
+  if (raw.trim().startsWith('share:')) {
+    const match = /^share:([a-f0-9]{12})$/i.exec(raw.trim());
+    const w = match && store.getWhisper(match[1]);
+    const allowed = w && w.inlinePrepared && w.media && w.chatType === 'inline' &&
+      w.fromId === fromId && w.status === 'active' && w.expiresAt > Date.now();
+    await bot.answerInline(query.id, allowed ? [inlineWhisperResult(w)] : [],
+      { cache_time: 0, is_personal: true });
+    return;
+  }
+
+  const parsed = whisper.parseInlineWhisperInput(raw, store, { maxTargets: cfg ? cfg.maxWhisperTargets : 5 });
 
   if (!parsed.targets.length) {
     const results = [{
@@ -1195,9 +1486,9 @@ async function handleInline(bot, store, query, cfg) {
       results.unshift({
         type: 'article', id: 'hint',
         title: '🤫 Whisper: @' + raw.replace(/^@?/, '').split(/\s+/)[0] + ' …',
-        description: 'Format: @username your secret',
+        description: 'Format: @username message [0 = hide sender]',
         input_message_content: {
-          message_text: '🤫 To whisper, mention the person first:\n<code>@' + esc(bot.username) + ' @alice your secret</code>',
+          message_text: '🤫 To whisper, name the person first:\n<code>@' + esc(bot.username) + ' @alice your secret</code>\n\nAdd <code>0</code> at the end to hide your name on the card (Telegram still shows who posted it).',
           parse_mode: 'HTML', link_preview_options: { is_disabled: true }
         }
       });
@@ -1210,10 +1501,27 @@ async function handleInline(bot, store, query, cfg) {
     await bot.answerInline(query.id, [{
       type: 'article', id: 'need-text',
       title: `🤫 Whisper to ${whisper.targetLabel(parsed.targets)}`,
-      description: '…now type the secret after the name',
+      description: 'Type a message, then add 0 to hide your name',
       input_message_content: {
-        message_text: `🤫 <b>Whisper to ${esc(whisper.targetLabel(parsed.targets))}</b>\n\nType the secret after the name: <code>@${esc(bot.username)} ${esc(raw)} your secret</code>`,
+        message_text: `🤫 <b>Whisper to ${esc(whisper.targetLabel(parsed.targets))}</b>\n\nType your message: <code>@${esc(bot.username)} @alice your secret</code>\nAdd <code>0</code> at the end to hide your name on the card (Telegram still shows who posted it).`,
         parse_mode: 'HTML', link_preview_options: { is_disabled: true }
+      }
+    }], { cache_time: 0, is_personal: true });
+    return;
+  }
+
+  const fromLabel = from.username ? '@' + from.username : label(from);
+  // Callback alerts fit only ~200 characters. Longer inline text uses the same
+  // authenticated private-bot reveal as media; never truncate a secret.
+  // The private text is wrapped in a DM header; stay under sendMessage's 4096.
+  const maxLength = Math.min((cfg && cfg.maxWhisperLength) || 3500, 3900);
+  if (parsed.text.length > maxLength) {
+    await bot.answerInline(query.id, [{
+      type: 'article', id: 'too-long',
+      title: `🚧 Shorten your whisper (max ${maxLength} characters)`,
+      description: 'This whisper was not sent.',
+      input_message_content: {
+        message_text: `🚧 Whisper not sent. Shorten it to ${maxLength} characters or use /w in a group with this bot.`
       }
     }], { cache_time: 0, is_personal: true });
     return;
@@ -1221,29 +1529,19 @@ async function handleInline(bot, store, query, cfg) {
 
   // Inline queries fire on every keystroke — reuse the record for identical input.
   const hash = require('crypto').createHash('sha1')
-    .update([fromId, parsed.targets.map((t) => t.key).join(','), parsed.text, JSON.stringify(parsed.flags)].join('|'))
+    .update([fromId, fromLabel, parsed.targets.map((t) => t.key).join(','), parsed.text, JSON.stringify(parsed.flags)].join('|'))
     .digest('hex').slice(0, 20);
   let w = store.dedupeWhisperKey(hash);
   if (!w) {
     w = whisper.createWhisper(store, { whisperTtlMs: cfg && cfg.whisperTtlMs }, {
       chatId: null, chatType: 'inline', chatTitle: null,
-      fromId, fromLabel: label(from), targets: parsed.targets,
+      fromId, fromLabel, targets: parsed.targets,
       text: parsed.text, flags: parsed.flags, classified: null
     });
     store.rememberWhisperKey(hash, w.id);
   }
 
-  await bot.answerInline(query.id, [{
-    type: 'article', id: w.id,
-    title: `🤫 Whisper to ${w.targetLabel}`,
-    description: `🔒 ${w.text.slice(0, 90)}`,
-    input_message_content: {
-      message_text: ui.whisperCardHTML(w),
-      parse_mode: 'HTML',
-      link_preview_options: { is_disabled: true }
-    },
-    reply_markup: ui.whisperKeyboard(w, false)
-  }], { cache_time: 0, is_personal: true });
+  await bot.answerInline(query.id, [inlineWhisperResult(w)], { cache_time: 0, is_personal: true });
 }
 
 /**
@@ -1254,11 +1552,9 @@ async function handleInline(bot, store, query, cfg) {
 async function handleChosenInlineResult(bot, store, result) {
   if (!result || !result.inline_message_id) return;
   const w = store.getWhisper(result.result_id);
-  if (!w) return;
-  store.updateWhisper(w.id, {
-    inlineMessageId: result.inline_message_id,
-    fromId: result.from && result.from.id != null ? String(result.from.id) : w.fromId
-  });
+  if (!w || !result.from || String(result.from.id) !== w.fromId) return;
+  // A chosen result must never transfer ownership of somebody else's secret.
+  store.updateWhisper(w.id, { inlineMessageId: result.inline_message_id });
 }
 
 // ------------------------------------------------------------- guest mode
@@ -1326,7 +1622,7 @@ module.exports = {
   // handlers
   handleStart, handleMessage, handleMenu, handleLink, handleStats, handlePause, handleResume,
   handleCancel, handleHelp, handleWall, handleGroup, handleCallback, handleInline,
-  handleChosenInlineResult, handleGuest, handleWhisper, handleReply, handleWhispers,
+  handleChosenInlineResult, handleGuest, handleWhisper, handleInlineMedia, handleReply, handleWhispers,
   handleId, handleAdmin, handleMyChatMember,
   // internals worth testing directly
   editPanel, editSessionPanel, privateReply, openPanel, panelOf, sendClassified, finishDelivery, isAdmin,

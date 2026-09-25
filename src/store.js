@@ -353,6 +353,7 @@ class Store {
       targetLabel: w.targetLabel || 'someone',
       text: w.text || '',
       media: w.media || null,           // {kind, type, fileId, caption, params}
+      inlinePrepared: !!w.inlinePrepared, // photo staged in DM; never in the public card
       oneTime: !!w.oneTime,
       allowSenderReopen: w.allowSenderReopen !== false,
       expiresAt: w.expiresAt || (Date.now() + 7 * DAY),

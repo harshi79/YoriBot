@@ -34,6 +34,9 @@ const { esc, NO_PREVIEW } = ui;
 // ------------------------------------------------------------------- parsing
 
 const TARGET_RE = /^(?:@([A-Za-z][A-Za-z0-9_]{2,31})|\[([^\]]{1,64})\]\(tg:\/\/user\?id=(\d{1,15})\)|(?:id|uid):(\d{1,15})|(\d{5,15}))$/;
+// Only the first inline target may omit @. /w still requires @ so ordinary
+// message text cannot accidentally be interpreted as another recipient.
+const BARE_USERNAME_RE = /^[A-Za-z][A-Za-z0-9_]{2,31}$/;
 
 /** `!5m` -> ms. `!1` -> one-time burn. */
 function parseFlag(token) {
@@ -64,7 +67,7 @@ function parseWhisperInput(raw, store, limits = {}) {
   let rest = String(raw == null ? '' : raw);
   const targets = [];
   const unknown = [];
-  const flags = { oneTime: false, signed: false, allowSenderReopen: true, ttlMs: null };
+  const flags = { oneTime: false, signed: !!limits.defaultSigned, allowSenderReopen: true, ttlMs: null };
 
   for (;;) {
     const lead = /^\s*/.exec(rest)[0];
@@ -81,7 +84,8 @@ function parseWhisperInput(raw, store, limits = {}) {
       continue;
     }
 
-    const tm = TARGET_RE.exec(token);
+    const tm = TARGET_RE.exec(token) || (limits.allowBareUsername && !targets.length && BARE_USERNAME_RE.test(token)
+      ? TARGET_RE.exec('@' + token) : null);
     if (!tm) break; // first non-target token -> everything left is the secret
 
     rest = body.slice(token.length);
@@ -120,6 +124,29 @@ function parseWhisperInput(raw, store, limits = {}) {
   return { targets: uniq, text: rest.replace(/^\s+/, ''), flags, unknown };
 }
 
+/**
+ * Inline whisper syntax: @bot @username|user_id message [0]. By default an
+ * inline card names its sender; a standalone final 0 hides the sender in the
+ * bot's card and reveal. The inline post itself still belongs to the Telegram
+ * account that selected it, so this is NOT an anonymity guarantee.
+ *
+ * A literal final zero can be written as \\0. Keep the suffix handling here so
+ * /w and guest whispers retain their original anonymous-by-default behaviour.
+ */
+function parseInlineWhisperInput(raw, store, limits = {}) {
+  const parsed = parseWhisperInput(raw, store, { ...limits, defaultSigned: true, allowBareUsername: true });
+  if (/(?:^|\s)\\0\s*$/.test(parsed.text)) {
+    parsed.text = parsed.text.replace(/\\0(?=\s*$)/, '0');
+  } else {
+    const suffix = /(?:^|\s)0\s*$/.exec(parsed.text);
+    if (suffix) {
+      parsed.text = parsed.text.slice(0, suffix.index).trimEnd();
+      parsed.flags.signed = false; // the trailing privacy switch wins over !sign
+    }
+  }
+  return parsed;
+}
+
 const targetLabel = (targets) => targets.map((t) => t.label).join(', ');
 
 /** Match a user against a whisper's target list (by id or by username). */
@@ -128,7 +155,7 @@ function canOpen(w, from) {
   const uid = String(from.id);
   const uname = from.username ? String(from.username).toLowerCase() : null;
   if (w.targets.some((t) => t.userId === uid)) return true;
-  if (uname && w.targets.some((t) => t.key === 'u:' + uname)) return true;
+  if (uname && w.targets.some((t) => !t.userId && t.key === 'u:' + uname)) return true;
   if (w.allowSenderReopen !== false && w.fromId === uid) return true;
   return false;
 }
@@ -137,8 +164,20 @@ const isRecipient = (w, from) => {
   if (!from || from.id == null) return false;
   const uid = String(from.id);
   const uname = from.username ? String(from.username).toLowerCase() : null;
-  return w.targets.some((t) => t.userId === uid || (uname && t.key === 'u:' + uname));
+  return w.targets.some((t) => t.userId === uid || (uname && !t.userId && t.key === 'u:' + uname));
 };
+
+/** Lock a username-only target to the first verified recipient's numeric id. */
+function bindRecipient(store, w, from) {
+  if (!w || !from || from.id == null || String(from.id) === w.fromId || !from.username) return false;
+  const key = 'u:' + String(from.username).toLowerCase();
+  let changed = false;
+  for (const t of w.targets) {
+    if (t.key === key && !t.userId) { t.userId = String(from.id); changed = true; }
+  }
+  if (changed) store.updateWhisper(w.id, { targets: w.targets });
+  return changed;
+}
 
 // ------------------------------------------------------------------ delivery
 
@@ -327,11 +366,8 @@ async function sendWhisperDm(bot, w, target) {
 
 // ------------------------------------------------------------------- reveal
 
-/**
- * Handle a tap on a locked card. Returns what the caller should tell Telegram.
- * @returns {{allowed:boolean, alert?:string, toast?:string, peek?:boolean, burn?:boolean}}
- */
-async function revealWhisper(bot, store, w, from) {
+/** Authorize a reveal without marking it read (used by private deep links). */
+async function checkWhisperAccess(bot, store, w, from) {
   if (!w) return { allowed: false, toast: '⌛ That whisper is gone.' };
   if (w.status === 'burned') return { allowed: false, toast: '🔥 Already burned.' };
   if (w.status === 'expired') return { allowed: false, toast: '⌛ That whisper expired.' };
@@ -344,12 +380,19 @@ async function revealWhisper(bot, store, w, from) {
   if (!canOpen(w, from)) {
     store.recordPeek(w.id);
     await bestEffort(reactCard(bot, w, SIGNAL.peeked), 'peek-react');
-    // Smooth in-place feedback: the card itself shows how many people are nosy.
     await bestEffort(editCard(bot, w, ui.whisperCardHTML(w),
       { parse_mode: 'HTML', ...NO_PREVIEW, reply_markup: ui.whisperKeyboard(w, false) }), 'peek-edit');
     return { allowed: false, peek: true, alert: "🤫 That whisper isn't for you.\n\n(Your curiosity has been noted — the sender can see how many people tried.)" };
   }
+  return { allowed: true };
+}
 
+/** Handle a tap on a locked card. Only the intended reader receives the text. */
+async function revealWhisper(bot, store, w, from) {
+  const access = await checkWhisperAccess(bot, store, w, from);
+  if (!access.allowed) return access;
+
+  bindRecipient(store, w, from);
   store.recordOpen(w.id, from.id);
   await bestEffort(reactCard(bot, w, SIGNAL.opened), 'open-react');
 
@@ -510,6 +553,7 @@ function createWhisper(store, cfg, spec) {
     targetLabel: targetLabel(spec.targets),
     text: spec.text || '',
     media: cls && cls.kind !== 'text' ? cls : null,
+    inlinePrepared: !!spec.inlinePrepared,
     oneTime: !!(spec.flags && spec.flags.oneTime),
     allowSenderReopen: spec.flags ? spec.flags.allowSenderReopen !== false : true,
     expiresAt: spec.flags && spec.flags.oneTime ? now + Math.min(ttl, 24 * 3600000) : now + ttl
@@ -525,8 +569,8 @@ function classifyBody(msg) {
 }
 
 module.exports = {
-  parseWhisperInput, parseFlag, targetLabel, canOpen, isRecipient, isGroupChat,
-  deliverWhisper, sendWhisperDm, revealWhisper, burnWhisper, expireWhisper,
+  parseWhisperInput, parseInlineWhisperInput, parseFlag, targetLabel, canOpen, isRecipient, bindRecipient, isGroupChat,
+  deliverWhisper, sendWhisperDm, checkWhisperAccess, revealWhisper, burnWhisper, expireWhisper,
   sweep, replyToWhisper, createWhisper, classifyBody, sendEphemeral,
   editCard, deleteCard, reactCard
 };

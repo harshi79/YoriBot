@@ -126,9 +126,10 @@ function createAdapter(bot, opts = {}) {
     },
 
     /** Bot API 10.1 rich message — the caller (src/rich.js) owns the fallback. */
-    async sendRich(chatId, html, o = {}) {
-      const { parse_mode, entities, ...rest } = o;
-      return bot.api.sendRichMessage({ chat_id: chatId, rich_message: { html }, ...rest });
+    async sendRich(chatId, content, o = {}) {
+      const { parse_mode, entities, link_preview_options, ...rest } = o;
+      return bot.api.sendRichMessage({ chat_id: chatId,
+        rich_message: typeof content === 'string' ? { html: content } : content, ...rest });
     },
 
     async editText(chatId, messageId, text, o = {}) {
@@ -137,17 +138,28 @@ function createAdapter(bot, opts = {}) {
         () => bot.api.editMessageText({ chat_id: chatId, message_id: messageId, text, ...o }));
     },
 
-    async editRich(chatId, messageId, html, o = {}) {
+    async editRich(chatId, messageId, content, o = {}) {
       const key = `r:${chatId}:${messageId}`;
       const { reply_markup } = o;
-      return smartEdit('rich', key, { html, markup: reply_markup },
-        () => bot.api.editMessageText({ chat_id: chatId, message_id: messageId, rich_message: { html }, reply_markup }));
+      const rich_message = typeof content === 'string' ? { html: content } : content;
+      return smartEdit('rich', key, { rich_message, markup: reply_markup },
+        () => bot.api.editMessageText({ chat_id: chatId, message_id: messageId, rich_message, reply_markup }));
     },
 
     async editMarkup(chatId, messageId, replyMarkup) {
       const key = `m:${chatId}:${messageId}`;
       return smartEdit('markup', key, replyMarkup,
         () => bot.api.editMessageReplyMarkup({ chat_id: chatId, message_id: messageId, reply_markup: replyMarkup }));
+    },
+
+    /** Refresh an already-delivered private photo/file in place instead of spamming a DM. */
+    async editMedia(chatId, messageId, type, fileId, caption, o = {}) {
+      const media = { type, media: fileId, caption: caption || undefined,
+        parse_mode: o.parse_mode,
+        ...(o.has_spoiler && ['photo', 'video', 'animation'].includes(type) ? { has_spoiler: true } : {}) };
+      const key = `md:${chatId}:${messageId}`;
+      return smartEdit('media', key, { media, markup: o.reply_markup },
+        () => bot.api.editMessageMedia({ chat_id: chatId, message_id: messageId, media, reply_markup: o.reply_markup }));
     },
 
     /** Inline-mode messages: only an inline_message_id, no chat. */
@@ -171,6 +183,7 @@ function createAdapter(bot, opts = {}) {
     async deleteMessage(chatId, messageId) {
       editCache.delete(`t:${chatId}:${messageId}`);
       editCache.delete(`m:${chatId}:${messageId}`);
+      editCache.delete(`md:${chatId}:${messageId}`);
       return bot.api.deleteMessage({ chat_id: chatId, message_id: messageId });
     },
 
@@ -218,6 +231,7 @@ function createAdapter(bot, opts = {}) {
 const PRIVATE_COMMANDS = [
   { command: 'start', description: 'Your anonymous link + how whispers work' },
   { command: 'w', description: 'Whisper someone (only they can read it)' },
+  { command: 'wi', description: 'Share a private photo through an inline locked card' },
   { command: 'r', description: 'Invisible reply to a whisper' },
   { command: 'menu', description: 'Control panel' },
   { command: 'link', description: 'Your anonymous link' },
@@ -333,6 +347,7 @@ function buildBot(token, overrides = {}) {
   // ---- commands (registered before the catch-all message handler) ----
   bot.command('start', (ctx) => { const m = M(ctx); if (m) return engine.handleStart(adapter, store, m); });
   bot.command(['w', 'whisper', 'psst', 'tell'], (ctx) => { const m = M(ctx); if (m) return engine.handleWhisper(adapter, store, m, cfg); });
+  bot.command('wi', (ctx) => { const m = M(ctx); if (m) return engine.handleInlineMedia(adapter, store, m, cfg); });
   bot.command(['r', 'reply', 'rw'], (ctx) => { const m = M(ctx); if (m) return engine.handleReply(adapter, store, m, cfg); });
   bot.command('id', (ctx) => { const m = M(ctx); if (m) return engine.handleId(adapter, store, m); });
   bot.command(['whispers', 'ws'], (ctx) => { const m = M(ctx); if (m) return engine.handleWhispers(adapter, store, m); });
