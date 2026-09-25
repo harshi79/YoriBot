@@ -65,14 +65,17 @@ Verified locally: with no token the server binds, `/healthz` → 200, `/ready` �
 chat via inline mode. Delivery follows a **ladder** — it uses the strongest thing
 the chat allows and degrades without ever leaking:
 
-1. **Ephemeral message** (Bot API 10.2) — visible *only* to the recipient, in the
-   group, auto-gone. Requires the bot to be a group admin; the first
+1. **Ephemeral message** (Bot API 10.2/10.3) — visible *only* to the recipient
+   in the group while their client displays it. It may disappear, and Telegram
+   does **not guarantee delivery**, especially to offline recipients. Requires
+   the bot to be a group admin; the first
    `chat_admin_required` / `not enough rights` error **latches** the capability off
    for that chat so we stop paying for doomed round-trips.
 2. **Locked card** — a normal group message showing only *"🤫 a whisper for @alice"*
-   with a button that works for one user id. Everyone else who taps it gets
-   `"not for you"`. Tap → reveal (the card is edited into the secret), burn, or
-   reply invisibly.
+   with a button authorized for its intended reader(s) and, by default, sender.
+   Everyone else who taps it gets `"not for you"`. Tap → reveal text in a private
+   popup; the card only
+   updates its status (it never publishes the secret).
 3. **Direct message** — if the sender wrote from a private chat, the target just
    gets a DM.
 
@@ -86,6 +89,58 @@ numeric ids *or* `tg://user?id=`, self-destruct flags (`!1` one-time read,
 expiry sweeps that rewrite dead cards to *"expired"*, and a public-reply
 interceptor (replying to a locked card in the group warns you instead of
 broadcasting your answer).
+
+### 💬 Inline whispers (sender label optional)
+
+Enable inline mode with `/setinline` in @BotFather, then type in any chat and
+**select the whisper card** from the results:
+
+| Type in the chat | Card shows | Secret shows to |
+| --- | --- | --- |
+| `@YourBot @alice meet me at 8` | "Whisper from @you to @alice" | Only @alice (and the sender) when they tap **Open** |
+| `@YourBot 123456789 meet me at 8 0` | "Whisper for user 123456789" (no sender label) | Only user 123456789 (and the sender) when they tap **Open** |
+
+A username may also be written without `@` as the **first** target. The final
+`0` must be a separate token at the very end: it is a privacy switch, **not**
+part of the secret. To end a message with a literal zero, write `\0` instead.
+`!anon` still hides the label; `!sign` still displays it, except a final `0`
+takes priority. `/w` and guest whispers keep their previous anonymous-by-default
+behaviour. The posted card never contains the secret text. Inline cards reveal
+through the **Open** button; unlike a `/w` whisper in a group, they cannot set up
+an in-chat `/r` reply context. Short text fits the private callback popup; **longer
+text** opens via a recipient-checked deep link in the bot's DM, in full instead
+of being truncated. The configured text limit still applies (at most 3,900
+characters for this route so the private Telegram message can include a header).
+
+#### 🖼 Private media behind an inline card
+
+1. In a **DM with the bot**, send `/wi @alice` (or `/wi 123456789 0` to omit the
+   sender label). Optional flags such as `!1` (one-time), `!5m` (expiry), and
+   `!nosender` go **before** the target: `/wi !1 @alice 0`. You can include a short
+   caption after the target.
+2. Send a photo, video, GIF, or document **to the bot in that DM**. The bot stages
+   the Telegram `file_id` and privately gives you a **Choose a chat** button.
+3. Select the **text-only locked card** in the destination chat. Neither the image
+   nor its caption/file ID is present in the public inline result.
+4. The recipient (and sender, unless `!nosender` was set) can tap **Open** and
+   follow the bot deep link. The bot rechecks the actor's user ID/username and
+   expiry, then sends the file in
+   their own **DM** with `protect_content` (and photo/video/GIF spoiler). Reopening
+   edits the existing private message when possible. For `!1`, the card burns
+   after successful delivery and the private message is scheduled for deletion
+   30 seconds later. They may have to start the bot before a DM can be sent.
+
+This does **not** put a secretly viewable image in the originating inline chat.
+Telegram's photo-type inline results publish the image to the whole chat, even
+under a spoiler or a collapsed rich block. Inline callbacks give the bot an
+`inline_message_id`, **not** a destination `chat_id` suitable for private media
+delivery there; `chat_instance` is not a chat ID. A DM is the safe supported path.
+`/w` group media whispers still use the existing ephemeral-or-refuse ladder.
+
+**Important:** Telegram displays the account that posts an inline message in the
+chat. `0` only hides the sender's name *in the bot's card and reveal*, not that
+Telegram attribution. For a private bot-posted whisper, use `/w` in a group where
+the bot can send ephemeral messages; do not rely on inline mode for true anonymity.
 
 ### 🕵️ Anonymous inbox (kept and improved)
 
@@ -110,7 +165,18 @@ says the message can't be edited any more (too old, deleted, wrong id, ephemeral
 expired) the panel is **re-created and the session re-pointed** — the flow never
 dead-ends. On top of that the adapter keeps a hash of every edit it has sent and
 skips identical ones, turns `message is not modified` into a success, and knows
-which errors mean "recreate it" versus "give up".
+which errors mean "recreate it" versus "give up". Private photo reopens use
+`editMessageMedia` with an existing `file_id`, while rich dashboards use
+`editMessageText` with `rich_message` instead of generating another message.
+
+`/admin` is **private-chat only**. With `RICH_MESSAGES=auto` or `on`, the dashboard
+is a real structured `InputRichBlockTable` (header cells, striped/compact rows),
+not a simulated monospaced table. **Refresh** and **Last reports** edit that same
+panel in place; capability failures latch rich off and fall back to classic HTML.
+Rich mode defaults to **off** because not every Telegram client supports rich
+blocks yet. The bot can detect a **server** capability error, not a client that
+renders a successful rich message as unsupported; keep rich off for those users.
+The classic HTML view works without configuration.
 
 ### 🛡 Safety and abuse
 
@@ -127,22 +193,33 @@ restricted to Telegram's official free emoji whitelist.
 
 ## 📚 The research behind it (free features, by Bot API version)
 
-| Version | Feature | How YoriBot uses it | Fallback when unsupported |
-| --- | --- | --- | --- |
-| **10.3** (Aug 2026) | `replace_callback_query_message`, rich edits of ephemeral messages | Used where an edit must replace the button message | Classic `editMessageText` |
-| **10.2** (Jul 2026) | **Ephemeral messages** — `ephemeral_message_parameters` on 13 send methods, `editEphemeralMessage{Text,Media,Caption,ReplyMarkup}`, `deleteEphemeralMessage`, `BotCommand.is_ephemeral`, `Message.receiver_user`/`ephemeral_message_id` | The whole whisper delivery layer, private acks, `/id` in groups, and group commands that leave no trace in the chat | Per-chat capability latch → locked card / DM |
-| **10.1** (Jun 2026) | **Rich messages** — `sendRichMessage`, `InputRichMessageContent`, 32,768 UTF-8 **bytes** | The `/start` welcome and `/help` long-form when `RICH_MESSAGES=auto\|on` | Same HTML as the fallback twin; a capability error latches rich off for the process |
-| **10.0** (May 2026) | **Guest mode** — `guest_message` update, `answerGuestQuery`, `User.supports_guest_queries` | `@YourBot @alice secret` works in chats the bot is **not** a member of | Silently ignored unless BotFather enables Guest Mode |
-| 9.x | Inline mode (`is_personal`), reactions (`setMessageReaction`), `reply_parameters`, `link_preview_options`, `protect_content`, spoiler entities, per-scope `setMyCommands`, `setMyName/Description/ShortDescription` | Share cards, signal reactions, threading, no-preview cards, privacy toggles, self-registering command menu | Always available on every client |
+Based on the official [1](https://core.telegram.org/bots/api-changelog) and the
+[2](https://core.telegram.org/bots/api) method/type definitions (checked September
+2026). These are **Bot API versions, not subscription tiers**:
+
+| Version | Supported free feature | Use in YoriBot / deliberate scope |
+| --- | --- | --- |
+| **10.3** (Aug 2026) | Consolidated `EphemeralMessageParameters`; `replace_callback_query_message`; compact rich tables; rich ephemeral edits | Whisper delivery uses `ephemeral_message_parameters`, admin table sets `is_compact`. We **do not** claim callback replacement enables inline-photo secrecy. |
+| **10.2** (Jul 2026) | Ephemeral group messages/edits/deletes; `BotCommand.is_ephemeral`; `InputRichMessage.blocks` including actual table blocks | `/w`, `/r`, private group acks, ephemeral commands; `/admin` uses table blocks opt-in. If unavailable, media `/w` fails closed and text uses a locked card. |
+| **10.1** (Jun 2026) | `sendRichMessage`, rich-message editing through `editMessageText`, `InputRichMessageContent` | Optional rich welcome/help/dashboard with a separate HTML fallback; large rich payloads are conservatively capped at 32 KiB. |
+| **10.0** (May 2026) | Guest queries, `answerGuestQuery`; business accounts no longer require Premium for bot integration | Optional guest whisper cards when enabled in BotFather. No business integration is needed. |
+| **9.5** (Mar 2026) | `sendMessageDraft` became available to **all** bots; date-time entities | Draft streaming isn't needed for a short whisper and isn't enabled just for appearance. |
+| **9.4** (Feb 2026) | `InlineKeyboardButton.style`; custom emoji buttons still depend on owner Premium in some contexts | Free primary/danger styles on new share/admin buttons, without custom emoji IDs. |
+| **9.3** (Dec 2025) | Private-chat topics and drafts | Existing DM compose sessions work without enabling topics. |
+| **9.2** (Aug 2025) | Checklist-task replies | No checklist-dependent flow. |
+| **9.1** (Jul 2025) | Checklist send/edit methods **on behalf of business accounts** | Not a general-purpose checklist for a standalone free whisper bot. |
+| Earlier | Inline cards, callback deep links, free reaction emoji, `protect_content`, spoilers, `editMessageMedia` | Locked cards, private media, edit-in-place and fallbacks continue to work without rich support. |
 
 Things deliberately **not** used, and why:
 
-- **Premium-only reactions / custom emoji** — bots can only use the free emoji set,
-  one reaction per message. Enforced in `src/reactions.js`.
-- **`sendChecklist`** — requires a `business_connection_id` a normal bot can't get.
-- **`message_effect_id`** — cosmetic, and effects only render on some clients.
-- **Rich messages on by default** — they render as *"not supported"* on Telegram
-  Web, so `RICH_MESSAGES=off` is the default and every rich send has an HTML twin.
+- **Premium-dependent custom emoji decorations and paid reactions**. Reactions
+  are restricted to Telegram's documented free emoji choices (`src/reactions.js`).
+- **`sendChecklist`**: its business-account context is separate from a normal bot
+  whisper, even though business integration itself need not require Premium.
+- **`sendMessageDraft`**: it is free now, but streaming drafts are unnecessary for
+  short whispers and don't make an inline photo private.
+- **Rich messages on by default**: some clients may show *"not supported"* for
+  rich blocks, so `RICH_MESSAGES=off` is the default and rich sends have HTML twins.
 
 ---
 
@@ -157,11 +234,16 @@ npm start
 **[@BotFather](https://t.me/BotFather) checklist:**
 
 1. `/newbot` → copy the token into `BOT_TOKEN`.
-2. `/setinline` → enable **inline mode** (powers `@YourBot @someone secret` and the share card).
-3. `/setprivacy` → **Disable** (so the bot sees the messages it needs in groups).
-4. `/setjoingroups` → **Enable** (whispers need the bot in the group).
-5. Optional: **Guest Mode** → enable, for whispers in chats the bot hasn't joined.
-6. Optional: add the bot as **admin** in your groups — that unlocks true ephemeral
+2. `/setinline` → enable **inline mode** (powers `@YourBot @someone secret [0]` and the share card).
+3. `/setinlinefeedback` → enable chosen-result updates (choose 100% if offered).
+   This lets the bot track the posted card's `inline_message_id` at selection and
+   update its status/expiry before anyone taps it. Without feedback, private
+   reveal still works; the bot may learn that ID only when a callback is tapped,
+   so unopened cards can remain visually stale after expiry.
+4. `/setprivacy` → **Disable** (so the bot sees the messages it needs in groups).
+5. `/setjoingroups` → **Enable** (whispers need the bot in the group).
+6. Optional: **Guest Mode** → enable, for whispers in chats the bot hasn't joined.
+7. Optional: add the bot as **admin** in your groups — that unlocks true ephemeral
    whispers instead of locked cards.
 
 Commands, descriptions and the profile are registered automatically on boot
@@ -177,11 +259,13 @@ and set `CHANNEL_ID`.
 
 | Command | Where | Description |
 | --- | --- | --- |
-| `/start [token]` | private | Your link, or open someone else's anonymous inbox |
+| `/start [token]` | private | Your link, open an anonymous inbox or open an authorized `wm_` inline whisper |
 | `/w <who> <secret>` | anywhere | Whisper. `/w @alice hi`, `/w 12345678 hi`, `/w` for a guided flow |
+| `/wi <who> [0]` | private | Stage a photo/video/GIF/document and share a text-only inline card; `0` hides sender label |
+| `@YourBot <who> <secret> [0]` | inline, anywhere | Locked card; shows sender → recipient unless a final `0` hides the sender label |
 | `/r <reply>` | anywhere | Invisible reply to your last whisper partner |
-| `/whispers` | anywhere | Your whisper history |
-| `/id` | anywhere | Your user id (ephemeral in groups) |
+| `/whispers` | anywhere | Your history; private ephemeral reply in groups or DM fallback |
+| `/id` | anywhere | Your user id; private ephemeral reply in groups or DM fallback |
 | `/menu` | private | Control panel — every toggle edits the same message |
 | `/link` | private | Your anonymous link + share button |
 | `/stats` | private | Received / sent / whispers |
@@ -190,7 +274,7 @@ and set `CHANNEL_ID`.
 | `/wall <text>` | private | Anonymous confession to the public channel |
 | `/cancel` | anywhere | Leave any compose flow |
 | `/help` | anywhere | How it all works |
-| `/admin` | admins | Live dashboard: users, whispers, opens/peeks/burns, reports, transport, rich gate — plus a **last reports** view |
+| `/admin` | admin DM | Private dashboard with opt-in rich table, HTML fallback, in-place **Refresh** and **Last reports** |
 
 In groups, `/w`, `/r`, `/id`, `/whispers` and `/link` are registered with
 `is_ephemeral: true`, so they never appear in the group transcript.
@@ -237,7 +321,7 @@ matter most:
 ## ✅ Tests
 
 ```bash
-npm test        # 38 checks, no token, no network
+npm test        # 56 checks, no token, no Telegram network
 ```
 
 Three layers, all offline:
@@ -246,18 +330,20 @@ Three layers, all offline:
    report/block, pause/resume, settings toggles, spoiler entities, auto-burn +
    sweeper, `/wall`, whisper parsing, the ephemeral → card → DM ladder, capability
    latching, media refusal, guided `/w` flow, expiry, inline share + whisper cards,
-   `chosen_inline_result`, guest mode, group Q&A + DM ack fallback.
-2. **Smooth-edit plumbing** — panel re-creation and session re-pointing, edit
-   de-duplication, `message is not modified`, `UNEDITABLE`, reaction coercion,
-   the rich gate, membership-change latch clearing, store persistence and pruning,
-   the HTTP routes and webhook auth.
+   `chosen_inline_result`, guest mode, group Q&A + DM ack fallback, inline media
+   staging/auth/expiry/burn, long-text DM reveal and private-only history fallback.
+2. **Smooth-edit plumbing** — panel re-creation and session re-pointing, text/
+   rich/media edit de-duplication, `message is not modified`, `UNEDITABLE`,
+   capability latch + HTML fallback, actual rich table blocks, admin refresh,
+   membership-change latch clearing, store persistence/pruning and HTTP auth.
 3. **Real client integration** — a genuine `node-telegram-bot-api` `Bot` with an
    injected `fetch` (the library's own test seam), fed real update objects. This
-   proves every method name and parameter shape we send actually exists and
-   serialises correctly: `ephemeral_message_parameters`, `reply_markup` as an
-   object, `is_ephemeral` commands, `deleteEphemeralMessage`, `answerInlineQuery`
-   with `is_personal`, `answerGuestQuery`, valid `setMessageReaction` emoji — and
-   that unrelated group chatter costs **zero** API calls.
+   verifies the method names and wire shapes (not a live Telegram acceptance test):
+   `ephemeral_message_parameters`, `editMessageMedia`, `sendRichMessage`, rich
+   `editMessageText`, `reply_markup` as an object, `is_ephemeral` commands,
+   `deleteEphemeralMessage`, personal inline articles, protected private photo
+   delivery, guest queries and free reactions — and unrelated group chatter
+   costs **zero** API calls.
 
 Plus the deploy regression test: spawn `src/index.js` with `PORT=0` and no token,
 assert a port opens, `/healthz` returns 200, and `SIGTERM` exits 0.
@@ -282,12 +368,12 @@ src/
   filter.js     banned-phrase abuse filter
   config.js     env parsing
 test/
-  selftest.js   38 offline checks incl. real-client integration + boot test
+  selftest.js   56 offline checks incl. real-client integration + boot test
 ```
 
 The engine never imports `node-telegram-bot-api`; it talks to a small adapter
 (`sendText`, `sendMedia`, `sendNative`, `sendRich`, `editText`, `editRich`,
-`editMarkup`, `editInline`, `editEphemeral`, `deleteMessage`, `deleteEphemeral`,
+`editMedia`, `editMarkup`, `editInline`, `editEphemeral`, `deleteMessage`, `deleteEphemeral`,
 `react`, `typing`, `answerCb`, `answerInline`, `answerGuest`). That is why the
 whole thing is testable without a token, and why swapping transports is cheap.
 
@@ -295,15 +381,26 @@ whole thing is testable without a token, and why swapping transports is cheap.
 
 ## 🔒 Privacy notes
 
-- Messages are re-sent by `file_id`/text, never `forwardMessage` — the sender's
-  identity is never in the payload.
-- Whispers are stored only as much as the ladder requires: sender id, target ids,
-  text and a TTL for the card flow. Ephemeral deliveries are additionally recorded
-  so reveal/burn/expire can edit them; nothing is sent anywhere else.
-- `protect_content` (opt-in) stops recipients forwarding or saving.
-- Report/block is one tap and immediately stops that sender.
-- Locked cards are keyed by user id: a wrong tapper gets `"not for you"` and learns
-  nothing about the content.
+- Media is re-sent privately by Telegram `file_id`, **never** `forwardMessage`;
+  the inline result contains only a text card. Sender names can be shown on signed
+  cards, and **Telegram always shows who posted an inline message**.
+- Whisper text, private captions, file IDs, sender/target IDs and expiry are
+  stored in the bot's JSON data file until cleanup. Protect the mounted volume;
+  bots and Telegram are not end-to-end-encrypted storage.
+- The protected inline-media DM uses `protect_content` to inhibit forwarding and
+  saving; **it cannot prevent screenshots or someone photographing a screen**.
+  One-time deletion is best-effort, not a cryptographic self-destruct.
+- When a target is specified **only by username** and the bot has no ID for it,
+  anyone who currently controls that username may be the first opener. Successful
+  authorization binds the ID for later opens. For stronger targeting, use a
+  numeric Telegram ID, especially if usernames can change hands.
+- Signed inline cards name sender and recipient; a final `0` removes the bot's
+  sender label but never Telegram's original inline post attribution. The sender
+  may also re-open their own whisper unless `!nosender` is set.
+- If private delivery isn't possible, inline media stays locked instead of being
+  posted publicly; `/whispers`, `/id`, menu and link fall back to DM or a generic
+  group hint rather than posting private state into the group.
+- Report/block is one tap and stops subsequent anonymous deliveries.
 
 ---
 

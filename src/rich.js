@@ -53,26 +53,28 @@ class RichGate {
 }
 
 const byteLength = (s) => Buffer.byteLength(String(s == null ? '' : s), 'utf8');
-const fits = (html) => byteLength(html) <= RICH_BYTE_LIMIT;
+// A conservative check for structured blocks: count the JSON envelope too.
+const fits = (content) => byteLength(typeof content === 'string' ? content : JSON.stringify(content)) <= RICH_BYTE_LIMIT;
 
 /**
  * Send `html` as a rich message when possible, else as a classic HTML message.
  *
  * @param {object} bot    adapter: needs sendRich() and sendText()
  * @param {string|number} chatId
- * @param {{html:string, opts?:object, gate?:RichGate}} spec
+ * @param {{html:string, rich?:object, opts?:object, gate?:RichGate}} spec
  * @returns {Promise<object>} the sent Message
  */
 async function sendRichOrText(bot, chatId, spec) {
   const gate = spec.gate;
   const html = spec.html;
+  const rich = spec.rich || { html };
   const opts = spec.opts || {};
 
-  if (!gate || !gate.enabled || typeof bot.sendRich !== 'function' || !fits(html)) {
+  if (!gate || !gate.enabled || typeof bot.sendRich !== 'function' || !fits(rich)) {
     return bot.sendText(chatId, html, opts);
   }
   try {
-    const msg = await bot.sendRich(chatId, html, opts);
+    const msg = await bot.sendRich(chatId, rich, opts);
     gate.noteSuccess();
     return msg;
   } catch (err) {
@@ -91,14 +93,18 @@ async function sendRichOrText(bot, chatId, spec) {
  */
 async function editRichOrText(bot, chatId, messageId, spec) {
   const gate = spec.gate;
-  if (!gate || !gate.enabled || typeof bot.editRich !== 'function' || !fits(spec.html)) {
+  const rich = spec.rich || { html: spec.html };
+  if (!gate || !gate.enabled || typeof bot.editRich !== 'function' || !fits(rich)) {
     return bot.editText(chatId, messageId, spec.html, spec.opts || {});
   }
   try {
-    const r = await bot.editRich(chatId, messageId, spec.html, spec.opts || {});
+    const r = await bot.editRich(chatId, messageId, rich, spec.opts || {});
     gate.noteSuccess();
     return r;
   } catch (err) {
+    const kind = classifyError(err).kind;
+    if (kind === KINDS.NOT_MODIFIED) return { ok: true, noop: true };
+    if (kind === KINDS.UNEDITABLE || kind === KINDS.NOT_FOUND) throw err;
     gate.noteError(err);
     gate.noteFallback();
     return bot.editText(chatId, messageId, spec.html, spec.opts || {});

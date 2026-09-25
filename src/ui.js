@@ -115,6 +115,14 @@ function whisperKeyboard(w, viewerIsSender) {
   return { inline_keyboard: [row] };
 }
 
+/** Staged privately via /wi; share ONLY the text-only locked card via inline mode. */
+function inlineMediaShareKeyboard(w) {
+  return { inline_keyboard: [
+    [{ text: '📤 Choose a chat for the locked card', style: 'primary', switch_inline_query: `share:${w.id}` }],
+    [{ text: '🗑 Discard draft', style: 'danger', callback_data: `wi_discard:${w.id}` }]
+  ] };
+}
+
 /** Buttons on an ephemeral (already-open) whisper — only the recipient sees them. */
 function whisperOpenKeyboard(w, canReply) {
   const rows = [[{ text: '🔥 Burn it', callback_data: `w_burn:${w.id}` }]];
@@ -134,7 +142,7 @@ function groupKeyboard(link) {
 function adminKeyboard() {
   return {
     inline_keyboard: [
-      [{ text: '📈 Refresh', callback_data: 'admin:refresh' }],
+      [{ text: '📈 Refresh', style: 'primary', callback_data: 'admin:refresh' }],
       [{ text: '🚩 Last reports', callback_data: 'admin:reports' }]
     ]
   };
@@ -150,7 +158,8 @@ function welcomeHTML(user, link, botName = 'this bot', botUsername = null) {
     `🕵️ <b>Anonymous inbox</b> — share your link and people message you with no name attached, and you can reply back still anonymous.\n\n` +
     `🔗 <b>Your link:</b>\n<code>${esc(link)}</code>\n\n` +
     `In a group try: <code>/w @someone your secret</code>\n` +
-    `Or mention me anywhere: <code>@${esc(botUsername || botName)} @someone your secret</code>`;
+    `Or type anywhere: <code>@${esc(botUsername || botName)} @someone your secret</code>\n` +
+    `Add <code>0</code> at the end to hide your name on the inline card (Telegram still shows who posted it).`;
 }
 
 function menuHTML(u, botUsername, botName = 'YoriBot') {
@@ -183,7 +192,7 @@ function helpHTML(botUsername, botName = 'YoriBot') {
     `<b>🤫 Whispers (group secrets)</b>\n` +
     `<code>/w @alice the password is 1234</code>\n` +
     `Alice sees it in the group; everyone else sees nothing at all — it's an <i>ephemeral message</i>, visible only to her and me.\n` +
-    `If I don't have admin rights in that group, I post a locked card instead and only Alice can open it.\n` +
+    `If I don't have admin rights in that group, I post a locked card instead. Alice (and you by default) can open it.\n` +
     `Alice answers with <code>/r her reply</code> — also invisible to the group.\n\n` +
     `<b>Whisper flags</b>\n` +
     `<code>!1</code> burn after first read • <code>!5m</code>/<code>!1h</code> auto-expire • <code>!nosender</code> you can't re-open it • <code>!sign</code> attach your name\n` +
@@ -194,6 +203,7 @@ function helpHTML(botUsername, botName = 'YoriBot') {
     `3️⃣ Conversations are threaded, so it reads like a real chat.\n\n` +
     `<b>Commands</b>\n` +
     `<code>/w</code> whisper someone in a group\n` +
+    `<code>/wi</code> prepare a private photo for a text-only inline card (DM only)\n` +
     `<code>/r</code> invisible reply to a whisper\n` +
     `<code>/id</code> your user id (private to you)\n` +
     `<code>/link</code> your anonymous link\n` +
@@ -205,7 +215,10 @@ function helpHTML(botUsername, botName = 'YoriBot') {
     `<code>/wall text</code> post to the public confession wall\n` +
     `<code>/cancel</code> leave anonymous mode\n` +
     `<code>/help</code> this message\n\n` +
-    `<b>Anywhere in Telegram</b>: type <code>@${at} @alice secret</code> and pick the card — no need to add me to the chat.\n\n` +
+    `<b>Anywhere in Telegram</b>: type <code>@${at} @alice secret</code> (or a numeric user id) and pick the card — no need to add me to the chat.\n` +
+    `The card shows who sent it and who it's for. Add a standalone <code>0</code> at the end to hide the sender label: <code>@${at} @alice secret 0</code>.\n` +
+    `Long inline text opens in a protected DM instead of being cut off. For images, DM me <code>/wi @alice 0</code>, send a photo/video/GIF/document, then share the locked text card. Only the recipient gets the file privately.\n` +
+    `⚠️ Telegram still shows the account that posted an inline message; <code>0</code> cannot hide that. Use numeric IDs for stronger targeting. /w stays anonymous by default.\n\n` +
     `🛡 Protect stops forwarding • 👁 Spoiler hides until tapped • 🔥 Auto-burn deletes what you receive.\n` +
     `🚩 Report / 🚫 Block on anything you receive.`;
 }
@@ -246,22 +259,39 @@ const composeReplyCaption = (cls) => '💬 <b>Reply (still anonymous)</b>' + (cl
 // ------------------------------------------------------------------ whispers
 
 const WHISPER_ALERT_LIMIT = 190; // answerCallbackQuery alerts are cut off around 200 chars
+const whisperAlertBody = (w) => `🤫 ${w.text || '(media whisper)'}\n\n${w.signed ? `— ${w.fromLabel}` : '— anonymous'}`;
+const whisperAlertFits = (w) => whisperAlertBody(w).length <= WHISPER_ALERT_LIMIT;
 
 /** The alert body shown when the right person opens a whisper. */
 function whisperAlertText(w) {
   const from = w.signed ? `— ${w.fromLabel}` : '— anonymous';
   const body = `🤫 ${w.text || '(media whisper)'}`;
-  const out = `${body}\n\n${from}`;
-  return out.length > WHISPER_ALERT_LIMIT
-    ? `${out.slice(0, WHISPER_ALERT_LIMIT - 1)}…\n(open in the group to read it all)`
-    : out;
+  const suffix = `\n\n${from}`;
+  const out = body + suffix;
+  if (out.length <= WHISPER_ALERT_LIMIT) return out;
+  // Telegram rejects oversized callback alerts. Keep the byline visible even
+  // for older long whispers, and never claim the full text is in the public card.
+  const shortened = body.slice(0, WHISPER_ALERT_LIMIT - suffix.length - 1)
+    .replace(/[\uD800-\uDBFF]$/, ''); // do not end in half an emoji
+  return shortened + '…' + suffix;
 }
 
 /** The locked card everybody in the chat can see. */
 function whisperCardHTML(w, opts = {}) {
-  const lines = [`🤫 <b>Whisper for ${esc(w.targetLabel)}</b>`];
+  // The card never contains the secret. Inline cards label the sender unless
+  // the 0 switch was used. For /w, !sign still only signs the private reveal;
+  // don't change the visibility of existing group whispers.
+  const heading = w.chatType === 'inline' && w.signed
+    ? `🤫 <b>Whisper from ${esc(w.fromLabel)} to ${esc(w.targetLabel)}</b>`
+    : `🤫 <b>Whisper for ${esc(w.targetLabel)}</b>`;
+  const lines = [heading];
   lines.push('');
-  lines.push('🔒 Only they can open it. Everyone else sees this lock.');
+  lines.push(w.allowSenderReopen === false
+    ? '🔒 Only intended recipients can open it. Everyone else sees the lock.'
+    : '🔒 Intended recipients or the sender can open it. Everyone else sees the lock.');
+  if (w.chatType === 'inline' && (w.inlinePrepared || !whisperAlertFits(w))) {
+    lines.push(w.media ? '📷 The media opens privately in the bot.' : '📖 The full text opens privately in the bot.');
+  }
   if (w.peeks > 0) lines.push(`👀 <b>${w.peeks}</b> ${w.peeks === 1 ? 'person has' : 'people have'} tried to peek`);
   if (w.openedBy.length > 0 && !w.oneTime) lines.push('✅ Opened');
   const left = w.expiresAt - (opts.now || Date.now());
@@ -291,6 +321,22 @@ function whisperDmHTML(w) {
     `<i>from ${who}</i>`;
 }
 
+function inlineMediaComposeHTML(targetLabel) {
+  return `🖼 <b>Prepare a private photo for ${esc(targetLabel)}</b>\n\n` +
+    `Send me a photo, video, GIF, or document here in our private chat. Its caption is private too.\n` +
+    `I'll give you a share button that posts a <b>text-only locked card</b> into any chat. ` +
+    `The chosen recipient (and you unless !nosender was set) can open the file in the bot DM.\n\n` +
+    `Tap Cancel to stop.`;
+}
+
+function inlineMediaReadyHTML(w) {
+  return `🖼 <b>Private media ready for ${esc(w.targetLabel)}</b>\n\n` +
+    `Pick a chat below and select the locked card. The photo/file is <b>never</b> attached to that card.\n` +
+    (w.signed ? `The card shows from ${esc(w.fromLabel)} to ${esc(w.targetLabel)}.\n`
+      : `No sender name on the card (Telegram still shows who posts inline messages).\n`) +
+    `The recipient opens the media privately in this bot. You can discard the draft until then.`;
+}
+
 function whisperListHTML(list, meId) {
   if (!list || !list.length) {
     return '🤫 <b>No whispers yet.</b>\n\nIn a group try <code>/w @someone your secret</code>, or mention me anywhere: <code>@bot @someone secret</code>.';
@@ -312,6 +358,27 @@ function groupLiveHTML() {
     `Admins: turn this off with <code>/group off</code>.`;
 }
 
+function adminRichMessage(stats) {
+  const row = (key, value) => [{ text: key }, { text: String(value) }];
+  return { blocks: [
+    { type: 'heading', size: 3, text: '🛠 YoriBot · live dashboard' },
+    { type: 'paragraph', text: 'Tap Refresh to update this message in place.' },
+    { type: 'table', is_bordered: true, is_striped: true, is_compact: true, cells: [
+      [{ text: 'Metric', is_header: true }, { text: 'Value', is_header: true }],
+      row('👥 Users', stats.users),
+      row('📨 Anonymous messages', stats.anonReceived || 0),
+      row('🤫 Whispers', stats.whispers || 0),
+      row('🔓 Opens', stats.whisperOpens || 0),
+      row('👀 Peeks', stats.whisperPeeks || 0),
+      row('🔥 Burns', stats.whisperBurns || 0),
+      row('👥 Groups / questions', `${stats.groups} / ${stats.groupQuestions || 0}`),
+      row('🚩 Reports', stats.reports || 0),
+      row('⚙️ Transport / rich', `${stats.transport || '?'} / ${stats.rich || '?'}`),
+      row('⏱ Uptime', stats.uptime || '?')
+    ] }
+  ] };
+}
+
 function adminHTML(stats) {
   return `🛠 <b>Bot admin</b>\n\n` +
     `👥 Users: <b>${stats.users}</b>\n` +
@@ -327,9 +394,9 @@ module.exports = {
   esc, NO_PREVIEW, linkFor, shareUrl, relTime,
   AUTO_DELETE_STEPS, autoDeleteLabel, nextAutoDelete,
   shareKeyboard, composeKeyboard, reportKeyboard, menuKeyboard, whisperKeyboard,
-  whisperOpenKeyboard, groupKeyboard, adminKeyboard,
+  inlineMediaShareKeyboard, whisperOpenKeyboard, groupKeyboard, adminKeyboard,
   welcomeHTML, menuHTML, statsHTML, helpHTML, composePanelHTML, groupPanelHTML,
   composeDelivered, composeReply, composeCaption, composeReplyCaption,
-  WHISPER_ALERT_LIMIT, whisperAlertText, whisperCardHTML, whisperEphemeralHTML,
-  whisperDmHTML, whisperListHTML, groupLiveHTML, adminHTML
+  WHISPER_ALERT_LIMIT, whisperAlertFits, whisperAlertText, whisperCardHTML, whisperEphemeralHTML,
+  whisperDmHTML, inlineMediaComposeHTML, inlineMediaReadyHTML, whisperListHTML, groupLiveHTML, adminHTML, adminRichMessage
 };
